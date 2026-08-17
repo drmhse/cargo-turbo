@@ -30,10 +30,55 @@ use std::process::Command;
 
 use crate::key::{self, Plan};
 
-/// Puts a recorded build back, returning whether anything was restored.
-pub fn restore(plan: &Plan) -> bool {
+/// How cargo will be asked to judge freshness for this build.
+///
+/// The choice has to be the same for a target directory's whole life. Recording a
+/// directory under timestamps and then checking it under content hashing
+/// invalidates every fingerprint at once: measured on tokio, a wiped-target
+/// restore that should take 0.08s took 2.44s, with almost everything rebuilt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Freshness {
+    /// Content hashing. Needed by a restored snapshot, whose sources may have
+    /// newer timestamps than the outputs built from them.
+    Checksum,
+    /// Timestamps, which is cargo's own default. Needed by a directory filled from
+    /// the shared unit store, whose entries content hashing rejects.
+    Mtime,
+}
+
+impl Freshness {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Checksum => "checksum",
+            Self::Mtime => "mtime",
+        }
+    }
+
+    fn from_label(label: &str) -> Self {
+        match label.trim() {
+            "mtime" => Self::Mtime,
+            // Snapshots recorded before the mode was written down were all made
+            // under content hashing.
+            _ => Self::Checksum,
+        }
+    }
+}
+
+/// What a restore managed to find.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hit {
+    /// The recorded build describes this one, so nothing needs saving after.
+    Exact,
+    /// A snapshot of the same workspace built against a different dependency set.
+    Near,
+    /// Nothing usable, so the target directory is left for the unit store to fill.
+    None,
+}
+
+/// Puts a recorded build back, reporting what it found and how it was recorded.
+pub fn restore(plan: &Plan) -> (Hit, Freshness) {
     if env::var("CARGO_TURBO_OFF").as_deref() == Ok("1") {
-        return false;
+        return (Hit::None, Freshness::Checksum);
     }
     // An exact match is best, but a snapshot of the same workspace built against
     // a different dependency set is still a far better starting point than
@@ -42,10 +87,12 @@ pub fn restore(plan: &Plan) -> bool {
     // back to a cold build.
     let (snapshot, exact) = match usable(&plan.snapshot()) {
         true => (plan.snapshot(), true),
-        false if env::var("CARGO_TURBO_NEAR").as_deref() == Ok("0") => return false,
+        false if env::var("CARGO_TURBO_NEAR").as_deref() == Ok("0") => {
+            return (Hit::None, Freshness::Checksum)
+        }
         false => match nearest_in_lineage(plan) {
             Some(path) => (path, false),
-            None => return false,
+            None => return (Hit::None, Freshness::Checksum),
         },
     };
     let tree = snapshot.join("target");
@@ -54,17 +101,22 @@ pub fn restore(plan: &Plan) -> bool {
     // may hold a build newer than this snapshot, and cargo is better placed to
     // decide that than we are.
     if plan.target_dir.exists() {
-        return false;
+        return (Hit::None, Freshness::Checksum);
     }
 
     if clone_tree(&tree, &plan.target_dir).is_err() {
         // A failed restore leaves nothing behind, so the build simply starts cold.
         let _ = fs::remove_dir_all(&plan.target_dir);
-        return false;
+        return (Hit::None, Freshness::Checksum);
     }
-    // Carried with the restore, because the snapshot was recorded in checksum
-    // mode and the fingerprints inside it only read correctly that way.
-    let _ = fs::write(plan.target_dir.join(MARKER), b"checksum-freshness\n");
+    // The mode travels with the snapshot, because the fingerprints inside it only
+    // read correctly under the one they were written by.
+    let freshness = fs::read_to_string(snapshot.join("mode"))
+        .map(|m| Freshness::from_label(&m))
+        .unwrap_or(Freshness::Checksum);
+    if freshness == Freshness::Checksum {
+        let _ = fs::write(plan.target_dir.join(MARKER), b"checksum-freshness\n");
+    }
     if exact {
         eprintln!("cargo-turbo: restored {}", plan.key);
     } else {
@@ -72,7 +124,7 @@ pub fn restore(plan: &Plan) -> bool {
     }
     // Only an exact match means the recorded build describes this one, so an
     // inexact restore still gets saved under its own key afterwards.
-    exact
+    (if exact { Hit::Exact } else { Hit::Near }, freshness)
 }
 
 /// Whether a snapshot directory holds a finished recording.
@@ -122,7 +174,7 @@ fn nearest_in_lineage(plan: &Plan) -> Option<PathBuf> {
 }
 
 /// Records a target directory, if it is worth recording.
-pub fn save(plan: &Plan) {
+pub fn save(plan: &Plan, freshness: Freshness) {
     if env::var("CARGO_TURBO_OFF").as_deref() == Ok("1") || !plan.target_dir.is_dir() {
         return;
     }
@@ -144,7 +196,12 @@ pub fn save(plan: &Plan) {
         return;
     }
     // Written before the marker, so a snapshot is never advertised as complete
-    // without the lineage a near-match restore needs to check.
+    // without the lineage a near-match restore needs to check, or the mode it has
+    // to be read under.
+    if fs::write(staging.join("mode"), freshness.label().as_bytes()).is_err() {
+        let _ = fs::remove_dir_all(&staging);
+        return;
+    }
     if fs::write(staging.join("lineage"), plan.lineage.as_bytes()).is_err() {
         let _ = fs::remove_dir_all(&staging);
         return;
@@ -163,27 +220,29 @@ pub fn save(plan: &Plan) {
 }
 
 /// Runs cargo for this plan, with the flags that make a restore usable.
-pub fn forward(plan: &Plan, args: &[String]) -> i32 {
+pub fn forward(plan: &Plan, args: &[String], freshness: Freshness) -> i32 {
     let mut command = cargo();
     command.args(args);
 
-    // The wrapper and content hashing both need unstable flags, so on stable the
-    // snapshot still restores and the rest is simply absent. Measured on
-    // rust-analyzer: a wiped target directory returns in 0.57s on stable, and a
-    // checkout with new timestamps rebuilds 51 of 309 units rather than 4.
+    // Only the thread allocation and content hashing need unstable flags, and
+    // neither the snapshot nor the shared dependencies do, so stable gets the same
+    // reuse and simply gives up the extra cores: tokio measured 0.10s on stable
+    // for a wiped target directory and 2.04s for a checkout never built before,
+    // matching nightly on both.
     if plan.nightly && env::var("CARGO_TURBO_OFF").as_deref() != Ok("1") {
         // Threads are free to add anywhere: cargo never sees the argument, so
         // fingerprints are untouched and an ordinary `cargo` run afterwards finds
         // the directory exactly as it left it.
         install_wrapper(&mut command);
 
-        if owns_target_dir(&plan.target_dir) {
-            // Content hashing rather than timestamps. Without it a fresh clone
-            // gives every source a newer timestamp than the restored outputs and
-            // the whole build starts again.
-            if !args.iter().any(|a| a.contains("checksum-freshness")) {
-                command.args(["-Z", "checksum-freshness"]);
-            }
+        // Content hashing rather than timestamps, when this build is one of the
+        // ones that wants it. Both modes exist because they suit opposite cases,
+        // and `Freshness` is where that choice is explained.
+        if freshness == Freshness::Checksum
+            && owns_target_dir(&plan.target_dir)
+            && !args.iter().any(|a| a.contains("checksum-freshness"))
+        {
+            command.args(["-Z", "checksum-freshness"]);
         }
     }
     run(command)
@@ -253,7 +312,7 @@ fn run(mut command: Command) -> i32 {
 
 /// Copies a tree, sharing blocks where the filesystem allows and always keeping
 /// mtimes.
-fn clone_tree(from: &Path, to: &Path) -> Result<(), String> {
+pub(crate) fn clone_tree(from: &Path, to: &Path) -> Result<(), String> {
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -334,11 +393,25 @@ pub fn status() -> i32 {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            // The shared units are counted separately, and there are hundreds of
+            // them, so the snapshot walk stops at their door.
+            if entry.file_name() == "units" {
+                continue;
+            }
             if path.join("complete").exists() {
                 count += 1;
             } else if path.is_dir() {
                 stack.push(path);
             }
+        }
+    }
+
+    // Prebuilt dependencies, which are what a project the store has never seen
+    // draws on, grouped by toolchain and profile.
+    let mut units = 0usize;
+    if let Ok(scopes) = fs::read_dir(store.join("units")) {
+        for scope in scopes.flatten() {
+            units += fs::read_dir(scope.path()).map_or(0, |e| e.count());
         }
     }
     // `du` reports what the files claim to occupy, which for clones is far more
@@ -352,7 +425,8 @@ pub fn status() -> i32 {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.split_whitespace().next().map(str::to_owned))
         .unwrap_or_else(|| "unknown".into());
-    println!("cargo-turbo: {count} snapshots, {size} logical (shared with the target directories they came from)");
+    println!("cargo-turbo: {count} snapshots and {units} shared dependency units");
+    println!("             {size} logical, shared with the target directories they came from");
     println!("             in {}", store.display());
     0
 }
@@ -389,6 +463,9 @@ mod tests {
         Plan {
             key: key.into(),
             lineage: lineage.into(),
+            profile_dir: "debug".into(),
+            toolchain: "test".into(),
+            lock_contents: String::new(),
             store: store.to_path_buf(),
             target_dir: store.join("unused-target"),
             nightly: true,
@@ -460,6 +537,22 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn the_mode_a_snapshot_was_recorded_under_survives_a_round_trip() {
+        // Restoring a timestamp-recorded snapshot and then checking it under
+        // content hashing invalidates every fingerprint: 0.08s became 2.44s.
+        assert_eq!(Freshness::from_label("mtime"), Freshness::Mtime);
+        assert_eq!(Freshness::from_label("checksum"), Freshness::Checksum);
+        assert_eq!(
+            Freshness::from_label(Freshness::Mtime.label()),
+            Freshness::Mtime
+        );
+        // Snapshots recorded before the mode was written down were all made under
+        // content hashing, so that is what a missing or unreadable label means.
+        assert_eq!(Freshness::from_label(""), Freshness::Checksum);
+        assert_eq!(Freshness::from_label("something else"), Freshness::Checksum);
     }
 
     #[test]

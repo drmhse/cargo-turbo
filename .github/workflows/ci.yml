@@ -40,3 +40,25 @@ jobs:
           /usr/bin/time -f 'first %e s' cargo +nightly turbo check --workspace -q
           rm -rf target
           /usr/bin/time -f 'warm  %e s' cargo +nightly turbo check --workspace -q
+      - name: check a second clone, which no snapshot covers
+        run: |
+          git clone --depth 1 https://github.com/BurntSushi/ripgrep /tmp/rg2
+          export PATH="$PWD/target/release:$PATH"
+          cd /tmp/rg2
+          /usr/bin/time -f 'plain %e s' cargo +nightly check --workspace -q
+          rm -rf target
+          /usr/bin/time -f 'fresh %e s' cargo +nightly turbo check --workspace -q
+
+  differential:
+    # Every acceleration is checked against plain cargo building the same source
+    # in a pristine directory. A difference in a program's output means something
+    # stale was served, which is the only failure worth failing the build over.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal
+      - run: cargo +nightly build --release
+      - name: dependency versions changing under a near-match restore
+        run: RUSTUP_TOOLCHAIN=nightly ./scripts/nearmatch_diff.sh
+      - name: feature sets varying across projects sharing a unit store
+        run: RUSTUP_TOOLCHAIN=nightly ./scripts/unitstore_diff.sh

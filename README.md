@@ -8,35 +8,46 @@ cargo install cargo-turbo
 cargo turbo check --workspace
 ```
 
-Measured on a ten-core Apple M4, checking rust-analyzer (309 units), nightly
-toolchain:
+Measured on a ten-core Apple M4, nightly toolchain, `check --workspace`, medians
+of three runs each. Reproduce with `scripts/measure.sh <git-url> check --workspace`.
 
-Medians of three runs each, nightly toolchain:
-
-| project | cold, `cargo` | cold, `cargo turbo` | warm, target wiped |
+| | rust-analyzer | tokio | ripgrep |
 |---|---|---|---|
-| rust-analyzer, 309 units | 22.85s | 16.77s (1.36x) | **0.36s (64x)** |
-| tokio | 3.66s | 2.81s (1.30x) | 0.11s (33x) |
-| ripgrep | 3.13s | 3.19s (0.98x) | 0.09s (33x) |
+| `cargo`, nothing to reuse | 20.98s | 3.44s | 2.72s |
+| `cargo turbo`, nothing to reuse | 16.00s (1.31x) | 2.57s (1.34x) | 3.33s (0.82x) |
+| `cargo turbo`, same checkout again | **0.25s (84x)** | **0.10s (34x)** | **0.09s (30x)** |
+| `cargo turbo`, a checkout it has never seen | **8.88s (2.6x)** | **1.31s (3.6x)** | **0.63s (4.3x)** |
 
-The warm column is the reliable win, and it is where the tool earns its place. The
-cold column depends on the shape of the dependency graph: rust-analyzer and tokio
-have a long chain of crates that compile one at a time, and ripgrep does not, so
-there is no idle machine to hand to rustc.
+Three different things are being reused, and the last row is the one most builds
+actually meet:
+
+- **The same checkout again** restores the target directory this build produced
+  last time. Nothing is compiled.
+- **A checkout it has never seen** is a fresh clone, a second worktree, or a CI
+  runner: no snapshot applies, but the dependencies were built here by some other
+  project. Only the workspace's own crates are compiled, 38 of rust-analyzer's 288
+  units and 7 of tokio's 43.
+- **Nothing to reuse** is a machine where cargo-turbo has never run. All that is
+  left is handing rustc the cores the dependency graph leaves idle, which depends
+  on the shape of that graph: rust-analyzer and tokio have a long chain of crates
+  that compile one at a time, and ripgrep does not, so there is no idle machine to
+  give away and the wrapper's overhead shows instead.
+
+Stable gets the same treatment. Nothing above needs an unstable flag:
+
+| tokio, stable | `cargo` | `cargo turbo` |
+|---|---|---|
+| same checkout again | 3.51s | **0.10s (35x)** |
+| a checkout it has never seen | 8.34s | **2.04s (4.1x)** |
 
 A changed `Cargo.lock` used to fall all the way back to a cold build, because the
 key it is derived from no longer matched anything. The nearest snapshot of the
-same workspace is now restored instead, and cargo rebuilds the difference. Tokio,
-target directory wiped, medians of three:
+same workspace is restored instead, and cargo rebuilds the difference:
 
 | what changed in the lock file | nearest snapshot restored | no snapshot |
 |---|---|---|
 | a leaf dependency added | **0.86s (2.9x)** | 2.50s |
 | a dependency several levels down bumped | **1.84s (1.4x)** | 2.65s |
-
-How much this buys depends on how much of the graph the change reaches: a new leaf
-leaves every existing unit valid, while bumping something deep invalidates
-everything above it.
 
 ## What it does
 
@@ -53,6 +64,15 @@ workspace, profile and command form a lineage, and the most recent member of the
 lineage is used when the exact key is absent. It is only ever a starting point:
 cargo's freshness pass decides what of it survives, so this can cost a rebuild and
 cannot produce a wrong answer.
+
+**Shares built dependencies between projects.** Of rust-analyzer's 288 units, 250
+are third-party and account for 77% of the CPU, and every artifact cargo writes is
+named `<crate>-<hash>` where the hash covers the package, its features, the
+profile, the compiler and the resolved dependencies. Two unrelated projects
+depending on the same version of a crate with the same features therefore produce
+the *same* names, and one project given the other's directories treats them as its
+own. The hash is cargo's own answer to "would this have to be rebuilt", so a
+different feature set or profile gets a different name and is never reused.
 
 **Records the target directory and puts it back.** Of those 309 units, most are
 third-party and immutable: a given version of a crate, built with the same
@@ -75,7 +95,11 @@ rebuilt and an error is always reported. Verified on every release:
 - restoring into a checkout where every file timestamp is new stays fast and correct
 - eight dependency-version changes in sequence, each built both by plain cargo in a
   pristine directory and by `cargo turbo` on top of a near match, produce identical
-  program output
+  program output (`scripts/nearmatch_diff.sh`)
+- five projects with overlapping dependencies and deliberately varied feature sets,
+  each built both by plain cargo in a pristine directory and by `cargo turbo`
+  against a store the others filled, produce identical program output
+  (`scripts/unitstore_diff.sh`)
 
 A key that is too coarse costs a rebuild, never a wrong answer, because cargo has
 the final say.
@@ -96,41 +120,40 @@ cargo turbo clean                     remove every snapshot
 | `CARGO_TURBO_JOBS` | cores to divide between invocations, default all |
 | `CARGO_TURBO_THREADS=0` | leave rustc single-threaded |
 | `CARGO_TURBO_NEAR=0` | require an exact key, never restore a near match |
+| `CARGO_TURBO_FRESHNESS=checksum` | judge freshness by content rather than timestamps |
 | `CARGO_TURBO_OFF=1` | forward to cargo unchanged |
+
+`CARGO_TURBO_FRESHNESS=checksum` is worth knowing about. It suits one case, a
+snapshot restored into a checkout whose files all have new timestamps, such as a
+cache unpacked over a fresh clone: tokio measured 0.11s that way against 0.97s
+under timestamps. It costs the sharing between projects, because a unit recorded
+under one mode is rejected under the other, so the two stores are kept apart and
+the timestamp one is the default. The choice is recorded with each snapshot, so a
+project keeps whichever mode its first build used.
 
 ## Requirements
 
 It works on stable, and better on nightly.
 
-Two unstable flags are used when they are available. `-Zthreads` is how rustc is
-asked to use more than one core, and `-Zchecksum-freshness` makes cargo compare
-file contents instead of timestamps.
+One unstable flag is used when it is available: `-Zthreads`, which is how rustc is
+asked to use more than one core. Everything else needs nothing unstable, so both
+the snapshot and the shared dependencies work on stable exactly as they do on
+nightly. What stable gives up is the thread allocation, so a build with nothing to
+reuse matches plain cargo.
 
-On **stable** the snapshot still restores, because a mtime-preserving clone needs
-no unstable flag. What stable gives up is the thread allocation, so a first build
-matches plain cargo, and timestamp independence, so a checkout with new
-timestamps rebuilds the crates whose sources appear newer. Dependencies keep their
-timestamps in the registry and stay fresh, which is most of the work.
-
-Measured on rust-analyzer, stable 1.97.1:
-
-| scenario | stable | nightly |
-|---|---|---|
-| first build | 23.80s | 16.38s |
-| target directory wiped, sources untouched | **0.57s** | 0.77s |
-| every source timestamp changed | 6.73s, 51 of 309 units rebuilt | 2.11s, 4 units rebuilt |
-
-The four that rebuild on nightly are build scripts and their dependents, because
-cargo still compares timestamps for the paths a build script declares even under
-checksum freshness.
+`-Zchecksum-freshness` is used only when `CARGO_TURBO_FRESHNESS=checksum` is asked
+for, and is unavailable on stable.
 
 A filesystem with copy-on-write clones (APFS, Btrfs, XFS) keeps snapshots free.
 Elsewhere they fall back to real copies and cost their size.
 
 ## What it does not do
 
-The first build of code never built before costs what it always did. The wins are
-in CI, fresh clones, wiped target directories, and switching between branches.
+Code that has never been built anywhere on the machine costs what it always did.
+A workspace's own crates are never shared between checkouts either, so the floor
+for a fresh clone is however long its own crates take: 8.88s of rust-analyzer's
+23.22s is exactly that. The wins are in CI, fresh clones, second worktrees, wiped
+target directories, and switching between branches.
 
 Snapshots are local to the machine, because a build script can read a system
 library or an environment variable that cargo never fingerprints, and its result

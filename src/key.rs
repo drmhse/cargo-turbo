@@ -24,6 +24,14 @@ pub struct Plan {
     pub target_dir: PathBuf,
     /// Whether the toolchain accepts the unstable flags this relies on.
     pub nightly: bool,
+    /// The profile directory cargo will write into, `debug` or `release` or the
+    /// name of a custom profile.
+    pub profile_dir: String,
+    /// Identifies the compiler and the flags, for scoping the shared unit store.
+    pub toolchain: String,
+    /// `Cargo.lock` as read, so which packages are local can be answered without
+    /// reading it a second time.
+    pub lock_contents: String,
     /// Identifies this workspace and profile without the resolved dependencies.
     ///
     /// An exact key changes whenever `Cargo.lock` does, so a dependency bump or a
@@ -70,17 +78,29 @@ impl Plan {
 
         // The resolved dependency set, which is what separates one snapshot of a
         // workspace from another.
-        let lock_contents =
-            fs::read(&lock).map_err(|e| format!("cannot read {}: {e}", lock.display()))?;
+        let lock_contents = fs::read_to_string(&lock)
+            .map_err(|e| format!("cannot read {}: {e}", lock.display()))?;
         let lineage = format!("{:016x}", hash(shared.as_bytes()));
         let key = format!(
             "{:016x}",
-            hash(format!("{lineage}\nlock:{:016x}", hash(&lock_contents)).as_bytes())
+            hash(format!("{lineage}\nlock:{:016x}", hash(lock_contents.as_bytes())).as_bytes())
         );
 
         Ok(Self {
             key,
             lineage,
+            profile_dir: profile_dir(args),
+            // Everything the shared unit store must not mix, which is the compiler
+            // and any flag that reaches it.
+            toolchain: format!(
+                "{rustc}|{cargo}|{}",
+                ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"]
+                    .iter()
+                    .filter_map(|v| env::var(v).ok())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            lock_contents,
             store: store_dir(),
             target_dir: manifest_dir.join("target"),
             nightly: rustc.contains("nightly") || rustc.contains("dev"),
@@ -92,6 +112,35 @@ impl Plan {
         // Two levels of fan-out, so the store stays quick to enumerate.
         self.store.join(&self.key[..2]).join(&self.key)
     }
+}
+
+/// Which directory under `target` cargo will write into.
+///
+/// Needed before cargo runs, because prebuilt units are copied in beforehand and
+/// they have to land where cargo will look for them. Cargo names the directory
+/// after the profile, except that the two built-in profiles have historical names.
+fn profile_dir(args: &[String]) -> String {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--release" || arg == "-r" {
+            return "release".into();
+        }
+        let named = if arg == "--profile" {
+            args.next().cloned()
+        } else {
+            arg.strip_prefix("--profile=").map(str::to_owned)
+        };
+        if let Some(profile) = named {
+            return match profile.as_str() {
+                // `test` and `bench` inherit from `dev` and `release`, and cargo
+                // writes them into those directories rather than their own.
+                "dev" | "test" => "debug".into(),
+                "bench" => "release".into(),
+                other => other.into(),
+            };
+        }
+    }
+    "debug".into()
 }
 
 /// Whether an argument should be left out of the key.
@@ -220,6 +269,35 @@ mod tests {
     }
 
     #[test]
+    fn the_profile_directory_matches_where_cargo_writes() {
+        assert_eq!(profile_dir(&["check".into()]), "debug");
+        assert_eq!(
+            profile_dir(&["build".into(), "--release".into()]),
+            "release"
+        );
+        assert_eq!(profile_dir(&["build".into(), "-r".into()]), "release");
+        // A custom profile gets a directory of its own.
+        assert_eq!(
+            profile_dir(&["build".into(), "--profile=fast".into()]),
+            "fast"
+        );
+        assert_eq!(
+            profile_dir(&["build".into(), "--profile".into(), "fast".into()]),
+            "fast"
+        );
+        // The built-in ones do not, which is what makes this worth a test: seeding
+        // `target/test` would put prebuilt units where cargo never looks.
+        assert_eq!(
+            profile_dir(&["test".into(), "--profile".into(), "test".into()]),
+            "debug"
+        );
+        assert_eq!(
+            profile_dir(&["bench".into(), "--profile".into(), "bench".into()]),
+            "release"
+        );
+    }
+
+    #[test]
     fn hashing_is_stable_and_distinguishes_inputs() {
         assert_eq!(hash(b"cargo turbo"), hash(b"cargo turbo"));
         assert_ne!(hash(b"check --workspace"), hash(b"check"));
@@ -233,6 +311,9 @@ mod tests {
         let plan = Plan {
             key: "abcdef0123456789".into(),
             lineage: "0000000000000000".into(),
+            profile_dir: "debug".into(),
+            toolchain: "test".into(),
+            lock_contents: String::new(),
             store: PathBuf::from("/store"),
             target_dir: PathBuf::from("/t"),
             nightly: true,
