@@ -21,4 +21,15 @@ jobs:
             echo "tag $tag does not match Cargo.toml $manifest"; exit 1; }
 
       - run: cargo +nightly test --release
-      - run: cargo +nightly publish --token ${{ secrets.CRATES_IO_API_KEY }}
+
+      # Skipped when the version is already on the index, so re-tagging or
+      # replaying a release is not an error. crates.io accepts a version once and
+      # never again, and the first 0.1.0 was published by hand.
+      - name: publish unless already there
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if cargo +nightly search cargo-turbo --limit 1 | grep -q "\"$version\""; then
+            echo "cargo-turbo $version is already published, nothing to do"
+          else
+            cargo +nightly publish --token ${{ secrets.CRATES_IO_API_KEY }}
+          fi
