@@ -27,6 +27,10 @@ actually meet:
   runner: no snapshot applies, but the dependencies were built here by some other
   project. Only the workspace's own crates are compiled, 38 of rust-analyzer's 288
   units and 7 of tokio's 43.
+- **Rebuilding in place** after an edit is left alone: the target directory already
+  holds what cargo needs, so nothing is restored and nothing is offered. Measured on
+  rust-analyzer, a no-op `check --workspace` costs 0.14s against cargo's 0.10s, and
+  a one-crate edit 3.66s against 3.55s.
 - **Nothing to reuse** is a machine where cargo-turbo has never run. All that is
   left is handing rustc the cores the dependency graph leaves idle, which depends
   on the shape of that graph: rust-analyzer and tokio have a long chain of crates

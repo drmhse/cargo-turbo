@@ -80,6 +80,14 @@ pub fn seed(plan: &Plan, freshness: Freshness) -> usize {
     }
     let profile = plan.target_dir.join(&plan.profile_dir);
 
+    // A directory cargo has already built in needs nothing: every entry offered
+    // would be skipped in favour of what is there, and the walk is wasted. It also
+    // covers the everyday case of rebuilding after an edit, which was paying for a
+    // seed it could not use and being told units had been supplied when none were.
+    if populated(&profile) {
+        return 0;
+    }
+
     // Only the packages this build actually resolves to, so an unrelated
     // project's crates are never copied in. The hash is unknown until cargo runs,
     // so every stored variant of a wanted package is offered and cargo picks the
@@ -108,12 +116,19 @@ pub fn seed(plan: &Plan, freshness: Freshness) -> usize {
 }
 
 /// Adds this build's third-party units to the store.
-pub fn record(plan: &Plan, freshness: Freshness) {
+pub fn record(plan: &Plan, freshness: Freshness, compiled: bool) {
     let profile = plan.target_dir.join(&plan.profile_dir);
     if !profile.is_dir() {
         return;
     }
     let store = unit_store(plan, freshness);
+    // A build that compiled nothing has nothing new to offer, so the walk over
+    // every unit in the directory is skipped -- which is every rebuild after an
+    // edit and every exact snapshot hit. The exception is a store that has been
+    // emptied: without it, a project whose builds always hit would never refill it.
+    if !compiled && store.is_dir() {
+        return;
+    }
     // Only packages this build resolved from outside the workspace. Asking
     // instead which units are *not* local admitted anything that happened to be
     // sitting in the directory, and a near-match restore leaves another
@@ -155,6 +170,13 @@ pub fn record(plan: &Plan, freshness: Freshness) {
             let _ = fs::remove_dir_all(&staging);
         }
     }
+}
+
+/// Whether cargo has already built in a profile directory.
+fn populated(profile: &Path) -> bool {
+    // `build` is where both layouts put their units, so its presence is the signal.
+    // An empty one is left behind by an interrupted build and is worth filling.
+    fs::read_dir(profile.join("build")).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 /// Every unit found in a profile directory, in whichever layout cargo used.
@@ -451,6 +473,24 @@ checksum = "abc"
             ],
             "another unit's artifacts must not be dragged in"
         );
+        let _ = fs::remove_dir_all(&profile);
+    }
+
+    #[test]
+    fn a_directory_cargo_has_built_in_is_left_alone() {
+        // Every offered entry would lose to what is already there, so the walk is
+        // pure cost -- and it was being paid on every rebuild after an edit.
+        let profile = scratch("units-populated");
+        assert!(!populated(&profile), "nothing there at all");
+
+        fs::create_dir_all(profile.join("build")).unwrap();
+        assert!(
+            !populated(&profile),
+            "an empty one is left by an interrupted build and is worth filling"
+        );
+
+        fs::create_dir_all(profile.join("build").join("serde").join("aaaa")).unwrap();
+        assert!(populated(&profile));
         let _ = fs::remove_dir_all(&profile);
     }
 

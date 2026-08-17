@@ -99,9 +99,9 @@ fn run_build(args: &[String]) -> i32 {
         if hit != snapshot::Hit::Exact {
             snapshot::save(&plan, freshness);
         }
-        // Recorded even after an exact hit, since the store may have been cleared
-        // or may never have seen these units.
-        units::record(&plan, freshness);
+        // An exact hit compiles nothing, so there is nothing new to add unless the
+        // store has been emptied since.
+        units::record(&plan, freshness, hit != snapshot::Hit::Exact);
     }
     status
 }

@@ -20,6 +20,20 @@
 //! Handing every invocation eight threads is worse than doing nothing: the
 //! fan-out phase is already full, and blanket `-Zthreads=8` took the same build
 //! from 27.51s to 39.08s.
+//!
+//! # Why there is no threshold
+//!
+//! A build with no tail has nothing to gain here and pays the wrapper's cost
+//! anyway: ripgrep takes 2.85s under plain cargo, 3.09s with this, and 2.82s with
+//! `CARGO_TURBO_THREADS=0`. Withholding threads until the build narrows was tried
+//! as a fix and helped neither case -- ripgrep measured 3.08s, 3.17s and 3.47s at
+//! thresholds of one, two and three siblings, and tokio was best with no threshold
+//! at all, at 2.57s against 3.24s at one. The graph shape that decides this is not
+//! visible from inside a single invocation, and the projects that lose and the
+//! projects that gain are not told apart by anything cheap: ripgrep loses and
+//! tokio gains with much the same package count and workspace depth. So the
+//! allocation stays unconditional, and a project that measures worse can turn it
+//! off.
 
 use std::env;
 use std::ffi::OsString;

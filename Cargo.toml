@@ -1,6 +1,6 @@
 [package]
 name = "cargo-turbo"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Makes cold Rust builds fast by reusing work and using the cores the dependency graph leaves idle"
 repository = "https://github.com/drmhse/cargo-turbo"
