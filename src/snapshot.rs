@@ -53,6 +53,9 @@ pub fn restore(plan: &Plan) -> bool {
         let _ = fs::remove_dir_all(&plan.target_dir);
         return false;
     }
+    // Carried with the restore, because the snapshot was recorded in checksum
+    // mode and the fingerprints inside it only read correctly that way.
+    let _ = fs::write(plan.target_dir.join(MARKER), b"checksum-freshness\n");
     eprintln!("cargo-turbo: restored {}", plan.key);
     true
 }
@@ -102,17 +105,48 @@ pub fn forward(plan: &Plan, args: &[String]) -> i32 {
     // rust-analyzer: a wiped target directory returns in 0.57s on stable, and a
     // checkout with new timestamps rebuilds 51 of 309 units rather than 4.
     if plan.nightly && env::var("CARGO_TURBO_OFF").as_deref() != Ok("1") {
-        // Content hashing rather than mtimes. Without it a fresh clone gives
-        // every source a newer mtime than the restored outputs and the whole
-        // build starts again. It has to be set for the build that *records* the
-        // snapshot as well, because fingerprints written in one mode are
-        // rejected wholesale by the other.
-        if !args.iter().any(|a| a.contains("checksum-freshness")) {
-            command.args(["-Z", "checksum-freshness"]);
-        }
+        // Threads are free to add anywhere: cargo never sees the argument, so
+        // fingerprints are untouched and an ordinary `cargo` run afterwards finds
+        // the directory exactly as it left it.
         install_wrapper(&mut command);
+
+        if owns_target_dir(&plan.target_dir) {
+            // Content hashing rather than timestamps. Without it a fresh clone
+            // gives every source a newer timestamp than the restored outputs and
+            // the whole build starts again.
+            if !args.iter().any(|a| a.contains("checksum-freshness")) {
+                command.args(["-Z", "checksum-freshness"]);
+            }
+        }
     }
     run(command)
+}
+
+/// The file marking a target directory as one this tool set up.
+const MARKER: &str = ".cargo-turbo-checksums";
+
+/// Whether the fingerprints in this target directory were written in checksum
+/// mode, so asking for it again is free.
+///
+/// Cargo rejects fingerprints written in the other mode wholesale, so switching
+/// rebuilds everything. A directory that plain `cargo` built is therefore left in
+/// timestamp mode: adding the flag to it would rebuild the world, and dropping it
+/// again on the next plain `cargo` run would rebuild the world a second time.
+/// Measured while alternating the two commands over rust-analyzer, that cost
+/// 16.91s and then 22.71s where an ordinary edit costs 4.20s.
+fn owns_target_dir(target_dir: &Path) -> bool {
+    if target_dir.join(MARKER).exists() {
+        return true;
+    }
+    // An absent or empty directory holds no fingerprints to be inconsistent
+    // with, so this is the one moment the mode can be chosen.
+    let empty = !target_dir.exists()
+        || fs::read_dir(target_dir).map(|d| d.count() == 0).unwrap_or(false);
+    if empty {
+        let _ = fs::create_dir_all(target_dir);
+        return fs::write(target_dir.join(MARKER), b"checksum-freshness\n").is_ok();
+    }
+    false
 }
 
 /// Runs cargo with nothing added, for when a plan could not be resolved.
@@ -155,8 +189,13 @@ fn clone_tree(from: &Path, to: &Path) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    // `-c` asks APFS to clone; `--reflink=auto` asks Btrfs and XFS, and falls
-    // back to a plain copy elsewhere. `-p` is what keeps the mtimes.
+    #[cfg(target_os = "macos")]
+    if clonefile_tree(from, to) {
+        return Ok(());
+    }
+
+    // `-c` asks APFS to clone per file; `--reflink=auto` asks Btrfs and XFS, and
+    // falls back to a plain copy elsewhere. `-p` is what keeps the mtimes.
     let attempts: &[&[&str]] = if cfg!(target_os = "macos") {
         &[&["-Rpc"], &["-Rp"]]
     } else {
@@ -175,6 +214,40 @@ fn clone_tree(from: &Path, to: &Path) -> Result<(), String> {
         let _ = fs::remove_dir_all(to);
     }
     Err(format!("could not copy {} to {}", from.display(), to.display()))
+}
+
+/// Clones a whole tree in one call, on APFS.
+///
+/// `clonefile` takes a directory and reproduces everything beneath it, sharing
+/// blocks and keeping timestamps. Doing that in the kernel rather than walking
+/// the tree is the difference between 41 ms and 565 ms for the 2,639 files of a
+/// rust-analyzer target directory, which is most of what a warm restore costs.
+///
+/// The destination must not exist, and `false` sends the caller to `cp`.
+#[cfg(target_os = "macos")]
+fn clonefile_tree(from: &Path, to: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    unsafe extern "C" {
+        fn clonefile(src: *const std::ffi::c_char, dst: *const std::ffi::c_char, flags: u32) -> i32;
+    }
+
+    let (Ok(src), Ok(dst)) = (
+        CString::new(from.as_os_str().as_bytes()),
+        CString::new(to.as_os_str().as_bytes()),
+    ) else {
+        return false;
+    };
+    // Safe: both pointers are valid nul-terminated paths for the duration of the
+    // call, and the flag set is empty.
+    let result = unsafe { clonefile(src.as_ptr(), dst.as_ptr(), 0) };
+    if result != 0 {
+        // A partial clone would be worse than none, so anything left behind goes.
+        let _ = fs::remove_dir_all(to);
+        return false;
+    }
+    true
 }
 
 pub fn status() -> i32 {

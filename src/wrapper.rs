@@ -87,12 +87,9 @@ struct Ticket {
 
 impl Ticket {
     fn claim() -> Option<Self> {
-        let dir = env::temp_dir().join(format!(
-            "cargo-turbo-{}",
-            // Scoped to the cargo process, so two builds running side by side
-            // each see their own width rather than each other's.
-            env::var("CARGO_PKG_NAME").unwrap_or_else(|_| parent_scope())
-        ));
+        // Scoped to the build, so two builds running side by side each see their
+        // own width rather than each other's.
+        let dir = env::temp_dir().join(format!("cargo-turbo-{}", build_scope()));
         fs::create_dir_all(&dir).ok()?;
         let path = dir.join(std::process::id().to_string());
         fs::write(&path, b"").ok()?;
@@ -112,21 +109,46 @@ impl Drop for Ticket {
     }
 }
 
-/// A name shared by every invocation of one cargo run.
+/// A name shared by every invocation of one cargo run, and only those.
 ///
-/// `CARGO_PKG_NAME` is absent when rustc is invoked for a dependency, so this
-/// falls back to the target directory, which cargo passes on every command line
-/// and which is the same for the whole build.
-fn parent_scope() -> String {
+/// The output directory is the right thing to key on: cargo passes it on every
+/// command line and it is identical for every unit of one build.
+///
+/// `CARGO_PKG_NAME` looks tempting and is wrong. Cargo sets it per crate, so
+/// scoping by it gave every invocation its own directory, and every invocation
+/// then saw one sibling and claimed the maximum share. That is the blanket
+/// allocation this exists to avoid: measured on rust-analyzer, handing eight
+/// threads to everything took a cold check from 26.28s to 39.08s. The mistake
+/// left 275 directories behind for a 309 unit build, which is how it was found.
+fn build_scope() -> String {
     let mut args = env::args();
     while let Some(arg) = args.next() {
-        if arg == "--out-dir" {
-            if let Some(dir) = args.next() {
-                return format!("{:016x}", crate::key::hash(dir.as_bytes()));
-            }
+        let dir = if arg == "--out-dir" {
+            args.next()
+        } else {
+            arg.strip_prefix("--out-dir=").map(str::to_owned)
+        };
+        if let Some(dir) = dir {
+            return format!("{:016x}", crate::key::hash(profile_root(&dir).as_bytes()));
         }
     }
-    "default".into()
+    "shared".into()
+}
+
+/// The output directory reduced to the profile it belongs to.
+///
+/// Ordinary units share `target/debug/deps`, but a build script is compiled into
+/// `target/debug/build/<pkg>-<hash>`, so keying on the directory verbatim gave
+/// every build script its own scope: 61 directories for two builds. Cutting the
+/// path at the profile leaves one name per profile per target directory, which is
+/// one name per build.
+fn profile_root(out_dir: &str) -> &str {
+    for marker in ["/debug/", "/release/"] {
+        if let Some(at) = out_dir.find(marker) {
+            return &out_dir[..at + marker.len()];
+        }
+    }
+    out_dir
 }
 
 fn available_cores() -> usize {
@@ -153,6 +175,50 @@ mod tests {
     fn the_share_divides_the_machine() {
         assert_eq!((10_usize / 4).clamp(1, MAX_THREADS), 2);
         assert_eq!((10_usize / 2).clamp(1, MAX_THREADS), 5);
+    }
+
+    #[test]
+    fn every_unit_of_one_build_shares_a_scope() {
+        // The scope must depend on the output directory and nothing else, or
+        // each invocation counts only itself and claims the whole machine.
+        let a = ["rustc", "--crate-name", "foo", "--out-dir", "/t/debug/deps"];
+        let b = ["rustc", "--crate-name", "bar", "--out-dir", "/t/debug/deps"];
+        assert_eq!(scope_of(&a), scope_of(&b));
+
+        let other = ["rustc", "--crate-name", "foo", "--out-dir", "/other/debug/deps"];
+        assert_ne!(scope_of(&a), scope_of(&other));
+    }
+
+    #[test]
+    fn a_build_script_shares_the_scope_of_the_units_around_it() {
+        // Cargo compiles build scripts into their own directory, and keying on
+        // that verbatim gave each one the whole machine.
+        assert_eq!(
+            profile_root("/t/target/debug/build/serde-abc123"),
+            profile_root("/t/target/debug/deps")
+        );
+        // Profiles stay apart, since a debug and a release build are separate work.
+        assert_ne!(
+            profile_root("/t/target/debug/deps"),
+            profile_root("/t/target/release/deps")
+        );
+    }
+
+    /// `build_scope` reads the real process arguments, so the logic is exercised
+    /// through the same parse over a supplied list.
+    fn scope_of(args: &[&str]) -> String {
+        let mut it = args.iter();
+        while let Some(arg) = it.next() {
+            let dir = if *arg == "--out-dir" {
+                it.next().map(|s| (*s).to_owned())
+            } else {
+                arg.strip_prefix("--out-dir=").map(str::to_owned)
+            };
+            if let Some(dir) = dir {
+                return format!("{:016x}", crate::key::hash(profile_root(&dir).as_bytes()));
+            }
+        }
+        "shared".into()
     }
 
     #[test]

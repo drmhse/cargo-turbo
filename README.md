@@ -11,18 +11,18 @@ cargo turbo check --workspace
 Measured on a ten-core Apple M4, checking rust-analyzer (309 units), nightly
 toolchain:
 
-| | seconds |
-|---|---|
-| `cargo check --workspace`, empty target directory | 23.07 |
-| `cargo turbo check --workspace`, first run | 16.38 |
-| `cargo turbo check --workspace`, target directory wiped | **0.77** |
-| the same, with every source timestamp changed | 2.11 |
+Medians of three runs each, nightly toolchain:
 
-| project | `cargo check` | `cargo turbo`, warm |
-|---|---|---|
-| rust-analyzer | 23.07s | 0.77s (30.0x) |
-| ripgrep | 5.33s | 0.21s (25.4x) |
-| tokio | 4.61s | 0.19s (24.3x) |
+| project | cold, `cargo` | cold, `cargo turbo` | warm, target wiped |
+|---|---|---|---|
+| rust-analyzer, 309 units | 22.85s | 16.77s (1.36x) | **0.36s (64x)** |
+| tokio | 3.66s | 2.81s (1.30x) | 0.11s (33x) |
+| ripgrep | 3.13s | 3.19s (0.98x) | 0.09s (33x) |
+
+The warm column is the reliable win, and it is where the tool earns its place. The
+cold column depends on the shape of the dependency graph: rust-analyzer and tokio
+have a long chain of crates that compile one at a time, and ripgrep does not, so
+there is no idle machine to hand to rustc.
 
 ## What it does
 
