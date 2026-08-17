@@ -15,7 +15,10 @@ if [ ! -x "$TURBO" ]; then
   echo "build it first: cargo build --release" >&2
   exit 2
 fi
-S=${TMPDIR:-/tmp}/unitstore
+# Extra arguments for both sides, so the same comparison can be run for a
+# cross-compiled build, where cargo writes into two directories rather than one.
+EXTRA=("$@")
+S=${TMPDIR:-/tmp}/unitstore${EXTRA[*]:+-cross}
 export CARGO_TURBO_DIR=$S/store
 rm -rf "$S"
 mkdir -p "$S"
@@ -62,7 +65,7 @@ for i in $(seq 0 $((${#NAMES[@]} - 1))); do
   # no store to draw on.
   rm -rf "$S/ref"
   setup "$S/ref" "$name" "$spec"
-  ref=$( (cd "$S/ref" && cargo run -q 2>&1) )
+  ref=$( (cd "$S/ref" && cargo run -q "${EXTRA[@]+${EXTRA[@]}}" 2>&1) )
   ref_status=$?
 
   # Under test: the same project, built with whatever the store already holds
@@ -74,7 +77,7 @@ for i in $(seq 0 $((${#NAMES[@]} - 1))); do
   rm -rf "$test"
   setup "$test" "$name" "$spec"
   (cd "$test" && cargo generate-lockfile -q)
-  raw=$( (cd "$test" && "$TURBO" run -q 2>&1) )
+  raw=$( (cd "$test" && "$TURBO" run -q "${EXTRA[@]+${EXTRA[@]}}" 2>&1) )
   status=$?
   out=$(printf '%s\n' "$raw" | grep -v '^cargo-turbo:')
   note=$(printf '%s\n' "$raw" | grep -o 'supplied [0-9]* prebuilt units')

@@ -24,9 +24,14 @@ pub struct Plan {
     pub target_dir: PathBuf,
     /// Whether the toolchain accepts the unstable flags this relies on.
     pub nightly: bool,
-    /// The profile directory cargo will write into, `debug` or `release` or the
-    /// name of a custom profile.
-    pub profile_dir: String,
+    /// The directories under `target` cargo will write into, relative to it.
+    ///
+    /// Usually one, named after the profile. A build with `--target` has two: the
+    /// units for that target go under `<triple>/<profile>`, and the ones for the
+    /// host running the compiler -- proc macros and build scripts -- stay in
+    /// `<profile>`. Both are worth sharing, and they must be kept apart, or an
+    /// entry would be offered to the directory it did not come from.
+    pub profile_dirs: Vec<String>,
     /// Identifies the compiler and the flags, for scoping the shared unit store.
     pub toolchain: String,
     /// `Cargo.lock` as read, so which packages are local can be answered without
@@ -89,7 +94,7 @@ impl Plan {
         Ok(Self {
             key,
             lineage,
-            profile_dir: profile_dir(args),
+            profile_dirs: profile_dirs(args),
             // Everything the shared unit store must not mix, which is the compiler
             // and any flag that reaches it.
             toolchain: format!(
@@ -114,12 +119,26 @@ impl Plan {
     }
 }
 
-/// Which directory under `target` cargo will write into.
+/// Which directories under `target` cargo will write into, relative to it.
 ///
 /// Needed before cargo runs, because prebuilt units are copied in beforehand and
-/// they have to land where cargo will look for them. Cargo names the directory
-/// after the profile, except that the two built-in profiles have historical names.
-fn profile_dir(args: &[String]) -> String {
+/// they have to land where cargo will look for them.
+fn profile_dirs(args: &[String]) -> Vec<String> {
+    let profile = profile_name(args);
+    match explicit_target(args) {
+        // Cross-compiling splits the output in two. The host directory holds the
+        // proc macros and build scripts, which are compiled for the machine doing
+        // the compiling whatever the build is aimed at.
+        Some(triple) => vec![format!("{triple}/{profile}"), profile],
+        None => vec![profile],
+    }
+}
+
+/// The profile directory's name.
+///
+/// Cargo names it after the profile, except that the two built-in profiles have
+/// historical names and the two that inherit from them share theirs.
+fn profile_name(args: &[String]) -> String {
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         if arg == "--release" || arg == "-r" {
@@ -132,8 +151,6 @@ fn profile_dir(args: &[String]) -> String {
         };
         if let Some(profile) = named {
             return match profile.as_str() {
-                // `test` and `bench` inherit from `dev` and `release`, and cargo
-                // writes them into those directories rather than their own.
                 "dev" | "test" => "debug".into(),
                 "bench" => "release".into(),
                 other => other.into(),
@@ -141,6 +158,21 @@ fn profile_dir(args: &[String]) -> String {
         }
     }
     "debug".into()
+}
+
+/// The target triple asked for on the command line, if any.
+fn explicit_target(args: &[String]) -> Option<String> {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--target" {
+            return args.next().cloned();
+        }
+        if let Some(triple) = arg.strip_prefix("--target=") {
+            return Some(triple.to_owned());
+        }
+    }
+    // Cargo also reads this, and a project that sets it cross-compiles every build.
+    env::var("CARGO_BUILD_TARGET").ok()
 }
 
 /// Whether an argument should be left out of the key.
@@ -268,33 +300,54 @@ mod tests {
         }
     }
 
+    /// Spelling out an argument list without the noise.
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
     #[test]
     fn the_profile_directory_matches_where_cargo_writes() {
-        assert_eq!(profile_dir(&["check".into()]), "debug");
-        assert_eq!(
-            profile_dir(&["build".into(), "--release".into()]),
-            "release"
-        );
-        assert_eq!(profile_dir(&["build".into(), "-r".into()]), "release");
+        assert_eq!(profile_name(&args(&["check"])), "debug");
+        assert_eq!(profile_name(&args(&["build", "--release"])), "release");
+        assert_eq!(profile_name(&args(&["build", "-r"])), "release");
         // A custom profile gets a directory of its own.
-        assert_eq!(
-            profile_dir(&["build".into(), "--profile=fast".into()]),
-            "fast"
-        );
-        assert_eq!(
-            profile_dir(&["build".into(), "--profile".into(), "fast".into()]),
-            "fast"
-        );
+        assert_eq!(profile_name(&args(&["build", "--profile=fast"])), "fast");
+        assert_eq!(profile_name(&args(&["build", "--profile", "fast"])), "fast");
         // The built-in ones do not, which is what makes this worth a test: seeding
         // `target/test` would put prebuilt units where cargo never looks.
+        assert_eq!(profile_name(&args(&["test", "--profile", "test"])), "debug");
         assert_eq!(
-            profile_dir(&["test".into(), "--profile".into(), "test".into()]),
-            "debug"
-        );
-        assert_eq!(
-            profile_dir(&["bench".into(), "--profile".into(), "bench".into()]),
+            profile_name(&args(&["bench", "--profile", "bench"])),
             "release"
         );
+    }
+
+    #[test]
+    fn cross_compiling_has_two_output_directories() {
+        // Getting this wrong is silent: nothing is offered and nothing is stored,
+        // because neither directory is where the units actually are. It matters for
+        // every release build that names a target, which is most of them.
+        assert_eq!(
+            profile_dirs(&args(&[
+                "build",
+                "--release",
+                "--target",
+                "x86_64-unknown-linux-musl"
+            ])),
+            ["x86_64-unknown-linux-musl/release", "release"]
+        );
+        assert_eq!(
+            profile_dirs(&args(&[
+                "zigbuild",
+                "--release",
+                "--target=aarch64-unknown-linux-musl"
+            ])),
+            ["aarch64-unknown-linux-musl/release", "release"]
+        );
+        // The host directory is the smaller half: it holds only the proc macros and
+        // build scripts, which are built for the machine doing the compiling
+        // whatever the build is aimed at.
+        assert_eq!(profile_dirs(&args(&["check"])), ["debug"]);
     }
 
     #[test]
@@ -311,7 +364,7 @@ mod tests {
         let plan = Plan {
             key: "abcdef0123456789".into(),
             lineage: "0000000000000000".into(),
-            profile_dir: "debug".into(),
+            profile_dirs: vec!["debug".into()],
             toolchain: "test".into(),
             lock_contents: String::new(),
             store: PathBuf::from("/store"),

@@ -74,11 +74,34 @@ struct Fragment {
 ///
 /// Returns how many units were supplied.
 pub fn seed(plan: &Plan, freshness: Freshness) -> usize {
-    let store = unit_store(plan, freshness);
+    // Only the packages this build actually resolves to, so an unrelated
+    // project's crates are never copied in. The hash is unknown until cargo runs,
+    // so every stored variant of a wanted package is offered and cargo picks the
+    // names it asked for.
+    let wanted = foreign_packages(plan);
+    let seeded: usize = plan
+        .profile_dirs
+        .iter()
+        .map(|dir| seed_one(plan, freshness, dir, &wanted))
+        .sum();
+    if seeded > 0 {
+        eprintln!("cargo-turbo: supplied {seeded} prebuilt units");
+    }
+    seeded
+}
+
+/// Fills one output directory, returning how many units it received.
+fn seed_one(
+    plan: &Plan,
+    freshness: Freshness,
+    profile_dir: &str,
+    wanted: &HashSet<String>,
+) -> usize {
+    let store = unit_store(plan, freshness, profile_dir);
     if !store.is_dir() {
         return 0;
     }
-    let profile = plan.target_dir.join(&plan.profile_dir);
+    let profile = plan.target_dir.join(profile_dir);
 
     // A directory cargo has already built in needs nothing: every entry offered
     // would be skipped in favour of what is there, and the walk is wasted. It also
@@ -88,11 +111,6 @@ pub fn seed(plan: &Plan, freshness: Freshness) -> usize {
         return 0;
     }
 
-    // Only the packages this build actually resolves to, so an unrelated
-    // project's crates are never copied in. The hash is unknown until cargo runs,
-    // so every stored variant of a wanted package is offered and cargo picks the
-    // names it asked for.
-    let wanted = foreign_packages(plan);
     let mut seeded = 0;
     let Ok(entries) = fs::read_dir(&store) else {
         return 0;
@@ -109,19 +127,35 @@ pub fn seed(plan: &Plan, freshness: Freshness) -> usize {
             seeded += 1;
         }
     }
-    if seeded > 0 {
-        eprintln!("cargo-turbo: supplied {seeded} prebuilt units");
-    }
     seeded
 }
 
 /// Adds this build's third-party units to the store.
 pub fn record(plan: &Plan, freshness: Freshness, compiled: bool) {
-    let profile = plan.target_dir.join(&plan.profile_dir);
+    // Only packages this build resolved from outside the workspace. Asking
+    // instead which units are *not* local admitted anything that happened to be
+    // sitting in the directory, and a near-match restore leaves another
+    // project's crates sitting in it: the store filled up with entries named
+    // after workspace crates of unrelated projects.
+    let shareable = foreign_packages(plan);
+    for dir in &plan.profile_dirs {
+        record_one(plan, freshness, dir, compiled, &shareable);
+    }
+}
+
+/// Adds one output directory's third-party units to the store.
+fn record_one(
+    plan: &Plan,
+    freshness: Freshness,
+    profile_dir: &str,
+    compiled: bool,
+    shareable: &HashSet<String>,
+) {
+    let profile = plan.target_dir.join(profile_dir);
     if !profile.is_dir() {
         return;
     }
-    let store = unit_store(plan, freshness);
+    let store = unit_store(plan, freshness, profile_dir);
     // A build that compiled nothing has nothing new to offer, so the walk over
     // every unit in the directory is skipped -- which is every rebuild after an
     // edit and every exact snapshot hit. The exception is a store that has been
@@ -129,12 +163,6 @@ pub fn record(plan: &Plan, freshness: Freshness, compiled: bool) {
     if !compiled && store.is_dir() {
         return;
     }
-    // Only packages this build resolved from outside the workspace. Asking
-    // instead which units are *not* local admitted anything that happened to be
-    // sitting in the directory, and a near-match restore leaves another
-    // project's crates sitting in it: the store filled up with entries named
-    // after workspace crates of unrelated projects.
-    let shareable = foreign_packages(plan);
 
     for fragment in fragments(&profile) {
         let Some(crate_name) = fragment.key.rsplit_once('-').map(|(c, _)| c) else {
@@ -276,27 +304,20 @@ fn merge_into(entry: &Path, profile: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Where entries live for this toolchain, profile and freshness mode.
+/// Where entries live for this toolchain, output directory and freshness mode.
 ///
-/// The compiler and profile are belt and braces, since cargo's hash already
-/// covers them: they keep a store from ever offering an entry built by a different
-/// toolchain, and keep a debug build from being offered release entries.
+/// The compiler and output directory are belt and braces, since cargo's hash
+/// already covers them: they keep a store from ever offering an entry built by a
+/// different toolchain, keep a debug build from being offered release entries, and
+/// keep a cross-compiled build's two directories from being offered each other's.
 ///
 /// The freshness mode is not optional. An entry recorded by a build that judged
 /// freshness by content hashing is rejected by one judging it by timestamps, and
 /// the other way round, so mixing them fills the store with entries that are
 /// offered and then ignored: measured on rust-analyzer, 269 units supplied and 235
 /// rebuilt regardless.
-fn unit_store(plan: &Plan, freshness: Freshness) -> PathBuf {
-    let scope = hash(
-        format!(
-            "{}|{}|{}",
-            plan.toolchain,
-            plan.profile_dir,
-            freshness.label()
-        )
-        .as_bytes(),
-    );
+fn unit_store(plan: &Plan, freshness: Freshness, profile_dir: &str) -> PathBuf {
+    let scope = hash(format!("{}|{profile_dir}|{}", plan.toolchain, freshness.label()).as_bytes());
     plan.store.join("units").join(format!("{scope:016x}"))
 }
 

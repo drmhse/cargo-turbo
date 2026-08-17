@@ -62,3 +62,5 @@ jobs:
         run: RUSTUP_TOOLCHAIN=nightly ./scripts/nearmatch_diff.sh
       - name: feature sets varying across projects sharing a unit store
         run: RUSTUP_TOOLCHAIN=nightly ./scripts/unitstore_diff.sh
+      - name: the same, cross-compiled, where cargo writes two directories
+        run: RUSTUP_TOOLCHAIN=nightly ./scripts/unitstore_diff.sh --target x86_64-unknown-linux-gnu

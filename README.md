@@ -103,7 +103,8 @@ rebuilt and an error is always reported. Verified on every release:
 - five projects with overlapping dependencies and deliberately varied feature sets,
   each built both by plain cargo in a pristine directory and by `cargo turbo`
   against a store the others filled, produce identical program output
-  (`scripts/unitstore_diff.sh`)
+  (`scripts/unitstore_diff.sh`), and again when cross-compiled, where cargo writes
+  a host directory and a target directory rather than one
 
 A key that is too coarse costs a rebuild, never a wrong answer, because cargo has
 the final say.

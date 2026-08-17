@@ -463,7 +463,7 @@ mod tests {
         Plan {
             key: key.into(),
             lineage: lineage.into(),
-            profile_dir: "debug".into(),
+            profile_dirs: vec!["debug".into()],
             toolchain: "test".into(),
             lock_contents: String::new(),
             store: store.to_path_buf(),
