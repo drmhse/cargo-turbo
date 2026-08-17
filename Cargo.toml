@@ -1,0 +1,21 @@
+[package]
+name = "cargo-turbo"
+version = "0.1.0"
+edition = "2021"
+description = "Makes cold Rust builds fast by reusing work and using the cores the dependency graph leaves idle"
+repository = "https://github.com/drmhse/cargo-turbo"
+license = "MIT OR Apache-2.0"
+keywords = ["cargo", "build", "cache", "performance"]
+categories = ["development-tools::cargo-plugins"]
+
+# No dependencies on purpose. This runs once per rustc invocation, so start-up
+# cost is part of the measurement, and a build accelerator that pulls in a
+# dependency tree of its own is a poor advertisement.
+
+[[bin]]
+name = "cargo-turbo"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
