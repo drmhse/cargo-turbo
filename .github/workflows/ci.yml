@@ -15,7 +15,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install nightly --profile minimal
+      # rustfmt and clippy are not in the minimal profile, so asking for them
+      # by name is what keeps the two checks below from failing to start.
+      - run: rustup toolchain install nightly --profile minimal --component rustfmt,clippy
       - run: cargo +nightly build --release
       - run: cargo +nightly test --release
       - run: cargo +nightly fmt --check
