@@ -101,6 +101,7 @@ ENVIRONMENT:
     CARGO_TURBO_DIR       where snapshots live (default: cache dir)
     CARGO_TURBO_JOBS      cores to divide between invocations (default: all)
     CARGO_TURBO_THREADS   set to 0 to leave rustc single-threaded
+    CARGO_TURBO_NEAR      set to 0 to require an exact key, never a near match
     CARGO_TURBO_OFF       set to 1 to forward to cargo unchanged"
     );
 }

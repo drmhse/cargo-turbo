@@ -25,7 +25,7 @@
 
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::key::{self, Plan};
@@ -35,11 +35,20 @@ pub fn restore(plan: &Plan) -> bool {
     if env::var("CARGO_TURBO_OFF").as_deref() == Ok("1") {
         return false;
     }
-    let snapshot = plan.snapshot();
+    // An exact match is best, but a snapshot of the same workspace built against
+    // a different dependency set is still a far better starting point than
+    // nothing: cargo's freshness pass rebuilds what actually differs. Without
+    // this, a `cargo update` or a branch with another lock file fell all the way
+    // back to a cold build.
+    let (snapshot, exact) = match usable(&plan.snapshot()) {
+        true => (plan.snapshot(), true),
+        false if env::var("CARGO_TURBO_NEAR").as_deref() == Ok("0") => return false,
+        false => match nearest_in_lineage(plan) {
+            Some(path) => (path, false),
+            None => return false,
+        },
+    };
     let tree = snapshot.join("target");
-    if !snapshot.join("complete").exists() || !tree.is_dir() {
-        return false;
-    }
 
     // Never overwrite work in progress. A target directory that already exists
     // may hold a build newer than this snapshot, and cargo is better placed to
@@ -56,8 +65,60 @@ pub fn restore(plan: &Plan) -> bool {
     // Carried with the restore, because the snapshot was recorded in checksum
     // mode and the fingerprints inside it only read correctly that way.
     let _ = fs::write(plan.target_dir.join(MARKER), b"checksum-freshness\n");
-    eprintln!("cargo-turbo: restored {}", plan.key);
-    true
+    if exact {
+        eprintln!("cargo-turbo: restored {}", plan.key);
+    } else {
+        eprintln!("cargo-turbo: restored a near match, cargo will rebuild the difference");
+    }
+    // Only an exact match means the recorded build describes this one, so an
+    // inexact restore still gets saved under its own key afterwards.
+    exact
+}
+
+/// Whether a snapshot directory holds a finished recording.
+fn usable(snapshot: &Path) -> bool {
+    snapshot.join("complete").exists() && snapshot.join("target").is_dir()
+}
+
+/// The most recently recorded snapshot of the same workspace and profile.
+///
+/// Recency is the right choice among near matches: the newest build of a
+/// workspace shares the most with the next one, whatever moved in between.
+fn nearest_in_lineage(plan: &Plan) -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut stack = vec![plan.store.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if !usable(&path) {
+                stack.push(path);
+                continue;
+            }
+            // Only snapshots of this workspace and profile, so a restore never
+            // hands cargo artifacts from an unrelated project.
+            if fs::read_to_string(path.join("lineage"))
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                != Some(plan.lineage.as_str())
+            {
+                continue;
+            }
+            let when = fs::metadata(path.join("complete"))
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if best.as_ref().is_none_or(|(b, _)| when > *b) {
+                best = Some((when, path));
+            }
+        }
+    }
+    best.map(|(_, path)| path)
 }
 
 /// Records a target directory, if it is worth recording.
@@ -79,6 +140,12 @@ pub fn save(plan: &Plan) {
         return;
     }
     if clone_tree(&plan.target_dir, &staging.join("target")).is_err() {
+        let _ = fs::remove_dir_all(&staging);
+        return;
+    }
+    // Written before the marker, so a snapshot is never advertised as complete
+    // without the lineage a near-match restore needs to check.
+    if fs::write(staging.join("lineage"), plan.lineage.as_bytes()).is_err() {
         let _ = fs::remove_dir_all(&staging);
         return;
     }
@@ -302,5 +369,114 @@ pub fn clean() -> i32 {
             eprintln!("cargo-turbo: could not remove {}: {e}", store.display());
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A finished snapshot on disk, as `save` would leave it.
+    fn record(store: &Path, key: &str, lineage: &str) -> PathBuf {
+        let dir = store.join(&key[..2]).join(key);
+        fs::create_dir_all(dir.join("target")).unwrap();
+        fs::write(dir.join("lineage"), lineage).unwrap();
+        fs::write(dir.join("complete"), key).unwrap();
+        dir
+    }
+
+    fn plan_for(store: &Path, key: &str, lineage: &str) -> Plan {
+        Plan {
+            key: key.into(),
+            lineage: lineage.into(),
+            store: store.to_path_buf(),
+            target_dir: store.join("unused-target"),
+            nightly: true,
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("turbo-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_near_match_is_only_taken_from_the_same_lineage() {
+        // Restoring another project's target directory would hand cargo artifacts
+        // for crates this build has never heard of.
+        let store = scratch("lineage");
+        let mine = record(&store, "aa11", "mine");
+        record(&store, "bb22", "theirs");
+
+        assert_eq!(
+            nearest_in_lineage(&plan_for(&store, "cc33", "mine")),
+            Some(mine)
+        );
+        assert_eq!(
+            nearest_in_lineage(&plan_for(&store, "cc33", "nobody")),
+            None
+        );
+
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn an_unfinished_snapshot_is_never_a_near_match() {
+        // Without the marker a snapshot may be a half-written directory, and
+        // handing that to cargo is worse than starting cold. The marker is written
+        // last by `save` for exactly this reason.
+        let store = scratch("partial");
+        let dir = store.join("aa").join("aa11");
+        fs::create_dir_all(dir.join("target")).unwrap();
+        fs::write(dir.join("lineage"), "mine").unwrap();
+
+        let plan = plan_for(&store, "cc33", "mine");
+        assert_eq!(nearest_in_lineage(&plan), None);
+
+        fs::write(dir.join("complete"), "aa11").unwrap();
+        assert_eq!(nearest_in_lineage(&plan), Some(dir));
+
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn the_newest_snapshot_of_a_lineage_wins() {
+        // Among near matches the most recent build shares the most with the next
+        // one, whatever moved in between.
+        let store = scratch("newest");
+        let older = record(&store, "aa11", "mine");
+        let newer = record(&store, "bb22", "mine");
+        // Recorded order is not guaranteed to be directory order, so the times are
+        // set explicitly.
+        let long_ago = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let recently = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000);
+        set_modified(&older.join("complete"), long_ago);
+        set_modified(&newer.join("complete"), recently);
+
+        assert_eq!(
+            nearest_in_lineage(&plan_for(&store, "cc33", "mine")),
+            Some(newer)
+        );
+
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn an_exact_key_is_preferred_over_any_near_match() {
+        // Cargo has to do no work at all for an exact hit, so a near match is only
+        // ever a fallback.
+        let store = scratch("exact");
+        record(&store, "aa11", "mine");
+        let plan = plan_for(&store, "aa11", "mine");
+        assert!(usable(&plan.snapshot()));
+
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    /// Stamping an mtime without depending on a crate to do it.
+    fn set_modified(path: &Path, when: std::time::SystemTime) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(when).unwrap();
     }
 }

@@ -24,6 +24,14 @@ pub struct Plan {
     pub target_dir: PathBuf,
     /// Whether the toolchain accepts the unstable flags this relies on.
     pub nightly: bool,
+    /// Identifies this workspace and profile without the resolved dependencies.
+    ///
+    /// An exact key changes whenever `Cargo.lock` does, so a dependency bump or a
+    /// branch with a different lock file missed the cache entirely and started
+    /// cold: measured on tokio, 0.10s became 2.75s. The lineage groups every
+    /// snapshot of one workspace and profile, so the nearest one can be restored
+    /// as a baseline and cargo asked to reconcile the difference.
+    pub lineage: String,
 }
 
 impl Plan {
@@ -31,24 +39,21 @@ impl Plan {
         let manifest_dir = workspace_root()?;
         let lock = manifest_dir.join("Cargo.lock");
 
-        let mut input = String::new();
-        // The resolved dependency set. This is the whole point of the key: it
-        // changes when a dependency version or source does, and not when an
-        // unrelated source file is edited.
-        let lock_contents =
-            fs::read(&lock).map_err(|e| format!("cannot read {}: {e}", lock.display()))?;
-        let _ = writeln!(input, "lock:{:016x}", hash(&lock_contents));
-
         // The compiler, because metadata from one rustc is not loadable by
         // another, and the cargo, because fingerprint formats change.
         let rustc = tool_version("rustc")?;
         let cargo = tool_version("cargo")?;
-        let _ = writeln!(input, "rustc:{rustc}\ncargo:{cargo}");
+
+        // Everything except the resolved dependencies. Two builds sharing this
+        // are close enough that one is a useful starting point for the other.
+        let mut shared = String::new();
+        let _ = writeln!(shared, "rustc:{rustc}\ncargo:{cargo}");
+        let _ = writeln!(shared, "root:{}", manifest_dir.display());
 
         // Anything on the command line that changes what gets built. Paths are
         // excluded deliberately: the same build in two checkouts should share.
         for arg in args.iter().filter(|a| !is_irrelevant(a)) {
-            let _ = writeln!(input, "arg:{arg}");
+            let _ = writeln!(shared, "arg:{arg}");
         }
 
         // Flags cargo folds into its own fingerprints.
@@ -59,12 +64,23 @@ impl Plan {
             "CARGO_PROFILE",
         ] {
             if let Some(v) = env::var_os(var) {
-                let _ = writeln!(input, "{var}:{}", v.to_string_lossy());
+                let _ = writeln!(shared, "{var}:{}", v.to_string_lossy());
             }
         }
 
+        // The resolved dependency set, which is what separates one snapshot of a
+        // workspace from another.
+        let lock_contents =
+            fs::read(&lock).map_err(|e| format!("cannot read {}: {e}", lock.display()))?;
+        let lineage = format!("{:016x}", hash(shared.as_bytes()));
+        let key = format!(
+            "{:016x}",
+            hash(format!("{lineage}\nlock:{:016x}", hash(&lock_contents)).as_bytes())
+        );
+
         Ok(Self {
-            key: format!("{:016x}", hash(input.as_bytes())),
+            key,
+            lineage,
             store: store_dir(),
             target_dir: manifest_dir.join("target"),
             nightly: rustc.contains("nightly") || rustc.contains("dev"),
@@ -119,6 +135,13 @@ fn workspace_root() -> Result<PathBuf, String> {
     }
 }
 
+/// The `-vV` banner of a tool.
+///
+/// This spawns a process on every run, and caching the answer against the
+/// binary's size and modification time was tried and removed: on a warm tokio
+/// restore it moved the median from 0.65s to 0.65s, so the two spawns are a few
+/// milliseconds rather than the tenth of a second guessed at. The cache only
+/// added a way to be wrong about which compiler was in use.
 fn tool_version(tool: &str) -> Result<String, String> {
     let out = Command::new(tool)
         .arg("-vV")
@@ -209,6 +232,7 @@ mod tests {
     fn snapshot_paths_fan_out_by_key_prefix() {
         let plan = Plan {
             key: "abcdef0123456789".into(),
+            lineage: "0000000000000000".into(),
             store: PathBuf::from("/store"),
             target_dir: PathBuf::from("/t"),
             nightly: true,

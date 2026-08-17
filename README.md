@@ -24,6 +24,20 @@ cold column depends on the shape of the dependency graph: rust-analyzer and toki
 have a long chain of crates that compile one at a time, and ripgrep does not, so
 there is no idle machine to hand to rustc.
 
+A changed `Cargo.lock` used to fall all the way back to a cold build, because the
+key it is derived from no longer matched anything. The nearest snapshot of the
+same workspace is now restored instead, and cargo rebuilds the difference. Tokio,
+target directory wiped, medians of three:
+
+| what changed in the lock file | nearest snapshot restored | no snapshot |
+|---|---|---|
+| a leaf dependency added | **0.86s (2.9x)** | 2.50s |
+| a dependency several levels down bumped | **1.84s (1.4x)** | 2.65s |
+
+How much this buys depends on how much of the graph the change reaches: a new leaf
+leaves every existing unit valid, while bumping something deep invalidates
+everything above it.
+
 ## What it does
 
 **Gives each rustc invocation a share of the machine.** A cold build is
@@ -33,6 +47,12 @@ ten cores, because dependencies fan out and saturate the machine for the first
 compile in a chain. rustc's frontend can use several threads, and during that
 tail every core but one is idle. Each invocation registers itself and counts how
 many others are running, so the share reflects how wide the build actually is.
+
+**Restores the nearest snapshot when there is no exact one.** Snapshots of one
+workspace, profile and command form a lineage, and the most recent member of the
+lineage is used when the exact key is absent. It is only ever a starting point:
+cargo's freshness pass decides what of it survives, so this can cost a rebuild and
+cannot produce a wrong answer.
 
 **Records the target directory and puts it back.** Of those 309 units, most are
 third-party and immutable: a given version of a crate, built with the same
@@ -53,6 +73,9 @@ rebuilt and an error is always reported. Verified on every release:
 - restoring then editing a source rebuilds that crate and its dependents
 - restoring then introducing a type error reports the error
 - restoring into a checkout where every file timestamp is new stays fast and correct
+- eight dependency-version changes in sequence, each built both by plain cargo in a
+  pristine directory and by `cargo turbo` on top of a near match, produce identical
+  program output
 
 A key that is too coarse costs a rebuild, never a wrong answer, because cargo has
 the final say.
@@ -72,6 +95,7 @@ cargo turbo clean                     remove every snapshot
 | `CARGO_TURBO_DIR` | where snapshots live, default `~/.cache/cargo-turbo` |
 | `CARGO_TURBO_JOBS` | cores to divide between invocations, default all |
 | `CARGO_TURBO_THREADS=0` | leave rustc single-threaded |
+| `CARGO_TURBO_NEAR=0` | require an exact key, never restore a near match |
 | `CARGO_TURBO_OFF=1` | forward to cargo unchanged |
 
 ## Requirements
