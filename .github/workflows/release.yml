@@ -1,0 +1,24 @@
+name: release
+
+# Publishing is driven by a tag, so the version that reaches crates.io is always
+# one that exists in the history under that name.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal
+
+      - name: the tag and the manifest must agree
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          test "$tag" = "$manifest" || {
+            echo "tag $tag does not match Cargo.toml $manifest"; exit 1; }
+
+      - run: cargo +nightly test --release
+      - run: cargo +nightly publish --token ${{ secrets.CRATES_IO_API_KEY }}

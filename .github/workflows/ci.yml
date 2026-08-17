@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        # The tool runs on both, and the copy path differs between them:
+        # clonefile on APFS, cp --reflink on Linux filesystems.
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal
+      - run: cargo +nightly build --release
+      - run: cargo +nightly test --release
+      - run: cargo +nightly fmt --check
+      - run: cargo +nightly clippy --release -- -D warnings
+
+  # Proves the thing it claims to do, on the repository it claims to do it to.
+  measure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal
+      - run: cargo +nightly build --release
+      - name: check a real workspace cold, then warm
+        run: |
+          git clone --depth 1 https://github.com/BurntSushi/ripgrep /tmp/rg
+          export PATH="$PWD/target/release:$PATH"
+          cd /tmp/rg
+          /usr/bin/time -f 'cold  %e s' cargo +nightly check --workspace -q
+          rm -rf target
+          /usr/bin/time -f 'first %e s' cargo +nightly turbo check --workspace -q
+          rm -rf target
+          /usr/bin/time -f 'warm  %e s' cargo +nightly turbo check --workspace -q
