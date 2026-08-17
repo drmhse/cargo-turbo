@@ -35,26 +35,31 @@ impl Plan {
         // The resolved dependency set. This is the whole point of the key: it
         // changes when a dependency version or source does, and not when an
         // unrelated source file is edited.
-        let lock_contents = fs::read(&lock)
-            .map_err(|e| format!("cannot read {}: {e}", lock.display()))?;
-        let _ = write!(input, "lock:{:016x}\n", hash(&lock_contents));
+        let lock_contents =
+            fs::read(&lock).map_err(|e| format!("cannot read {}: {e}", lock.display()))?;
+        let _ = writeln!(input, "lock:{:016x}", hash(&lock_contents));
 
         // The compiler, because metadata from one rustc is not loadable by
         // another, and the cargo, because fingerprint formats change.
         let rustc = tool_version("rustc")?;
         let cargo = tool_version("cargo")?;
-        let _ = write!(input, "rustc:{rustc}\ncargo:{cargo}\n");
+        let _ = writeln!(input, "rustc:{rustc}\ncargo:{cargo}");
 
         // Anything on the command line that changes what gets built. Paths are
         // excluded deliberately: the same build in two checkouts should share.
         for arg in args.iter().filter(|a| !is_irrelevant(a)) {
-            let _ = write!(input, "arg:{arg}\n");
+            let _ = writeln!(input, "arg:{arg}");
         }
 
         // Flags cargo folds into its own fingerprints.
-        for var in ["RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_PROFILE"] {
+        for var in [
+            "RUSTFLAGS",
+            "RUSTDOCFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_PROFILE",
+        ] {
             if let Some(v) = env::var_os(var) {
-                let _ = write!(input, "{var}:{}\n", v.to_string_lossy());
+                let _ = writeln!(input, "{var}:{}", v.to_string_lossy());
             }
         }
 
@@ -82,12 +87,21 @@ impl Plan {
 /// nothing.
 fn is_irrelevant(arg: &str) -> bool {
     const OUTPUT_ONLY: &[&str] = &[
-        "-q", "--quiet", "-v", "--verbose", "-vv", "--color", "--message-format", "--timings",
+        "-q",
+        "--quiet",
+        "-v",
+        "--verbose",
+        "-vv",
+        "--color",
+        "--message-format",
+        "--timings",
     ];
     arg.contains('/')
         || arg.starts_with("--target-dir")
         || arg.starts_with("--manifest-path")
-        || OUTPUT_ONLY.iter().any(|f| arg == *f || arg.starts_with(&format!("{f}=")))
+        || OUTPUT_ONLY
+            .iter()
+            .any(|f| arg == *f || arg.starts_with(&format!("{f}=")))
 }
 
 /// The directory holding `Cargo.lock`, found by walking up from the current one.
@@ -120,7 +134,9 @@ pub fn store_dir() -> PathBuf {
     if let Some(dir) = env::var_os("CARGO_TURBO_DIR") {
         return PathBuf::from(dir);
     }
-    let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_else(env::temp_dir);
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir);
     home.join(".cache").join("cargo-turbo")
 }
 
@@ -153,14 +169,29 @@ mod tests {
     #[test]
     fn verbosity_does_not_enter_the_key() {
         // A quiet build and a verbose one produce the same artifacts.
-        for flag in ["-q", "--quiet", "-v", "--verbose", "--color=never", "--message-format=json"] {
+        for flag in [
+            "-q",
+            "--quiet",
+            "-v",
+            "--verbose",
+            "--color=never",
+            "--message-format=json",
+        ] {
             assert!(is_irrelevant(flag), "{flag} should not affect the key");
         }
     }
 
     #[test]
     fn anything_that_changes_the_build_does_enter_the_key() {
-        for flag in ["check", "build", "--workspace", "--release", "--all-features", "-p", "test"] {
+        for flag in [
+            "check",
+            "build",
+            "--workspace",
+            "--release",
+            "--all-features",
+            "-p",
+            "test",
+        ] {
             assert!(!is_irrelevant(flag), "{flag} must affect the key");
         }
     }

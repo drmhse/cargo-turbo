@@ -48,7 +48,10 @@ pub fn run() -> i32 {
     match command.status() {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
-            eprintln!("cargo-turbo: could not run {}: {e}", rustc.to_string_lossy());
+            eprintln!(
+                "cargo-turbo: could not run {}: {e}",
+                rustc.to_string_lossy()
+            );
             1
         }
     }
@@ -185,7 +188,13 @@ mod tests {
         let b = ["rustc", "--crate-name", "bar", "--out-dir", "/t/debug/deps"];
         assert_eq!(scope_of(&a), scope_of(&b));
 
-        let other = ["rustc", "--crate-name", "foo", "--out-dir", "/other/debug/deps"];
+        let other = [
+            "rustc",
+            "--crate-name",
+            "foo",
+            "--out-dir",
+            "/other/debug/deps",
+        ];
         assert_ne!(scope_of(&a), scope_of(&other));
     }
 
@@ -226,7 +235,10 @@ mod tests {
         let dir = env::temp_dir().join(format!("cargo-turbo-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let ticket = Ticket { path: dir.join("1"), dir: dir.clone() };
+        let ticket = Ticket {
+            path: dir.join("1"),
+            dir: dir.clone(),
+        };
         fs::write(&ticket.path, b"").unwrap();
         assert_eq!(ticket.siblings(), 1);
         drop(ticket);

@@ -141,7 +141,9 @@ fn owns_target_dir(target_dir: &Path) -> bool {
     // An absent or empty directory holds no fingerprints to be inconsistent
     // with, so this is the one moment the mode can be chosen.
     let empty = !target_dir.exists()
-        || fs::read_dir(target_dir).map(|d| d.count() == 0).unwrap_or(false);
+        || fs::read_dir(target_dir)
+            .map(|d| d.count() == 0)
+            .unwrap_or(false);
     if empty {
         let _ = fs::create_dir_all(target_dir);
         return fs::write(target_dir.join(MARKER), b"checksum-freshness\n").is_ok();
@@ -203,17 +205,17 @@ fn clone_tree(from: &Path, to: &Path) -> Result<(), String> {
     };
 
     for flags in attempts {
-        let status = Command::new("cp")
-            .args(*flags)
-            .arg(from)
-            .arg(to)
-            .status();
+        let status = Command::new("cp").args(*flags).arg(from).arg(to).status();
         if matches!(status, Ok(s) if s.success()) {
             return Ok(());
         }
         let _ = fs::remove_dir_all(to);
     }
-    Err(format!("could not copy {} to {}", from.display(), to.display()))
+    Err(format!(
+        "could not copy {} to {}",
+        from.display(),
+        to.display()
+    ))
 }
 
 /// Clones a whole tree in one call, on APFS.
@@ -230,7 +232,8 @@ fn clonefile_tree(from: &Path, to: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
 
     unsafe extern "C" {
-        fn clonefile(src: *const std::ffi::c_char, dst: *const std::ffi::c_char, flags: u32) -> i32;
+        fn clonefile(src: *const std::ffi::c_char, dst: *const std::ffi::c_char, flags: u32)
+            -> i32;
     }
 
     let (Ok(src), Ok(dst)) = (
@@ -259,7 +262,9 @@ pub fn status() -> i32 {
     let mut count = 0usize;
     let mut stack = vec![store.clone()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.join("complete").exists() {
