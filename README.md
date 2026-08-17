@@ -114,8 +114,29 @@ the final say.
 ```
 cargo turbo <cargo-command> [args…]   run a cargo command, accelerated
 cargo turbo status                    what is stored
-cargo turbo clean                     remove every snapshot
+cargo turbo clean                     remove every snapshot and unit
 ```
+
+### When cargo is invoked by something else
+
+Release pipelines usually call cargo from a script or another build tool, and
+rewriting that to go through `cargo turbo` is often not worth it. The two halves
+are available as their own steps instead:
+
+```
+cargo turbo prepare build --release --target x86_64-unknown-linux-musl
+./whatever-already-runs-the-build
+cargo turbo store build --release --target x86_64-unknown-linux-musl
+```
+
+`prepare` fills the target directory with prebuilt dependencies and stops; `store`
+adds what the build produced. Pass the arguments the build will use, since they say
+which profile and target it is for and so where the units belong. Both are
+optimisations, so neither fails a pipeline: if anything is wrong they say so and
+exit successfully, and the build that follows is correct, only slower.
+
+Measured with plain cargo doing the build, a second project cross-compiling to a
+target the store already holds: 2.89s to **0.35s**, one crate compiled.
 
 ## Environment
 

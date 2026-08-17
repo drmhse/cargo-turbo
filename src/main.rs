@@ -54,6 +54,8 @@ fn main() {
         }
         Some("clean") => exit(snapshot::clean()),
         Some("status") => exit(snapshot::status()),
+        Some("prepare") => exit(prepare(&args[1..])),
+        Some("store") => exit(store(&args[1..])),
         _ => exit(run_build(&args)),
     }
 }
@@ -106,6 +108,47 @@ fn run_build(args: &[String]) -> i32 {
     status
 }
 
+/// Fills the target directory with prebuilt dependencies, then stops.
+///
+/// For builds this cannot run itself. A release pipeline usually invokes cargo
+/// through a script or a build tool, and rewriting that to go through `cargo turbo`
+/// is often not worth it, so the two halves are available as their own steps:
+/// `cargo turbo prepare <the cargo arguments>` before the build and `cargo turbo
+/// store <the same arguments>` after it. The arguments are needed because they say
+/// which profile and which target the build is for, and so where the units belong.
+fn prepare(args: &[String]) -> i32 {
+    let plan = match key::Plan::resolve(args) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("cargo-turbo: {e}");
+            // Preparation is an optimisation, so failing to do it is not an error:
+            // the build that follows is still correct, only slower.
+            return 0;
+        }
+    };
+    // Timestamps, matching what a plain `cargo` run does afterwards. Content
+    // hashing would reject every unit supplied here.
+    let seeded = units::seed(&plan, snapshot::Freshness::Mtime);
+    if seeded == 0 {
+        eprintln!("cargo-turbo: nothing to supply");
+    }
+    0
+}
+
+/// Adds what the target directory now holds to the shared store.
+fn store(args: &[String]) -> i32 {
+    let plan = match key::Plan::resolve(args) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("cargo-turbo: {e}");
+            return 0;
+        }
+    };
+    units::record(&plan, snapshot::Freshness::Mtime, true);
+    eprintln!("cargo-turbo: stored the third-party units of this build");
+    0
+}
+
 fn print_help() {
     println!(
         "\
@@ -114,7 +157,19 @@ cargo turbo — faster cold Rust builds, without patching cargo or rustc
 USAGE:
     cargo turbo <cargo-command> [args…]     run a cargo command, accelerated
     cargo turbo status                      what is stored, and how much space
-    cargo turbo clean                       remove every snapshot
+    cargo turbo clean                       remove every snapshot and unit
+
+FOR A BUILD THIS CANNOT RUN ITSELF:
+    cargo turbo prepare <cargo-args…>       supply prebuilt dependencies, then stop
+    cargo turbo store <cargo-args…>         add this build's dependencies to the store
+
+    Use these when cargo is invoked by a script or another build tool. Pass the
+    same arguments the build will use, since they say which profile and target it
+    is for. Between the two, run the build however you already do.
+
+      cargo turbo prepare build --release --target x86_64-unknown-linux-musl
+      ./my-build-script
+      cargo turbo store build --release --target x86_64-unknown-linux-musl
 
 EXAMPLES:
     cargo turbo check --workspace

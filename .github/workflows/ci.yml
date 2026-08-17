@@ -64,3 +64,16 @@ jobs:
         run: RUSTUP_TOOLCHAIN=nightly ./scripts/unitstore_diff.sh
       - name: the same, cross-compiled, where cargo writes two directories
         run: RUSTUP_TOOLCHAIN=nightly ./scripts/unitstore_diff.sh --target x86_64-unknown-linux-gnu
+      - name: prepare and store as separate steps, with plain cargo in between
+        run: |
+          export PATH="$PWD/target/release:$PATH"
+          git clone --depth 1 https://github.com/BurntSushi/ripgrep /tmp/rg-steps
+          git clone --depth 1 https://github.com/BurntSushi/ripgrep /tmp/rg-steps2
+          cd /tmp/rg-steps
+          cargo +nightly build --release -q
+          cargo +nightly turbo store build --release
+          cd /tmp/rg-steps2
+          cargo +nightly turbo prepare build --release
+          # The build itself is plain cargo, as it would be behind a build script.
+          /usr/bin/time -f 'prepared %e s' cargo +nightly build --release -q
+          test -x target/release/rg
