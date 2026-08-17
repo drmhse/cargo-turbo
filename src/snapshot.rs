@@ -97,6 +97,10 @@ pub fn forward(plan: &Plan, args: &[String]) -> i32 {
     let mut command = cargo();
     command.args(args);
 
+    // The wrapper and content hashing both need unstable flags, so on stable the
+    // snapshot still restores and the rest is simply absent. Measured on
+    // rust-analyzer: a wiped target directory returns in 0.57s on stable, and a
+    // checkout with new timestamps rebuilds 51 of 309 units rather than 4.
     if plan.nightly && env::var("CARGO_TURBO_OFF").as_deref() != Ok("1") {
         // Content hashing rather than mtimes. Without it a fresh clone gives
         // every source a newer mtime than the restored outputs and the whole

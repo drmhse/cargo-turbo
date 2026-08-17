@@ -8,15 +8,21 @@ cargo install cargo-turbo
 cargo turbo check --workspace
 ```
 
-Measured on a ten-core Apple M4, checking rust-analyzer (309 units) from an empty
-target directory:
+Measured on a ten-core Apple M4, checking rust-analyzer (309 units), nightly
+toolchain:
 
 | | seconds |
 |---|---|
-| `cargo check --workspace` | 27.51 |
-| `cargo turbo check --workspace`, first run | 21.91 |
-| `cargo turbo check --workspace`, target directory wiped | **0.90** |
-| the same, into a fresh clone with new file timestamps | 2.11 |
+| `cargo check --workspace`, empty target directory | 23.07 |
+| `cargo turbo check --workspace`, first run | 16.38 |
+| `cargo turbo check --workspace`, target directory wiped | **0.77** |
+| the same, with every source timestamp changed | 2.11 |
+
+| project | `cargo check` | `cargo turbo`, warm |
+|---|---|---|
+| rust-analyzer | 23.07s | 0.77s (30.0x) |
+| ripgrep | 5.33s | 0.21s (25.4x) |
+| tokio | 4.61s | 0.19s (24.3x) |
 
 ## What it does
 
@@ -70,12 +76,29 @@ cargo turbo clean                     remove every snapshot
 
 ## Requirements
 
-A nightly toolchain, for two unstable flags: `-Zthreads`, which is how rustc is
-asked to use more than one core, and `-Zchecksum-freshness`, which makes cargo
-compare file contents instead of timestamps. Without the second, restoring into a
-fresh clone would rebuild everything, since a clone gives every source a newer
-timestamp than the outputs built from it. On a stable toolchain the tool forwards
-to cargo unchanged rather than doing something unsound.
+It works on stable, and better on nightly.
+
+Two unstable flags are used when they are available. `-Zthreads` is how rustc is
+asked to use more than one core, and `-Zchecksum-freshness` makes cargo compare
+file contents instead of timestamps.
+
+On **stable** the snapshot still restores, because a mtime-preserving clone needs
+no unstable flag. What stable gives up is the thread allocation, so a first build
+matches plain cargo, and timestamp independence, so a checkout with new
+timestamps rebuilds the crates whose sources appear newer. Dependencies keep their
+timestamps in the registry and stay fresh, which is most of the work.
+
+Measured on rust-analyzer, stable 1.97.1:
+
+| scenario | stable | nightly |
+|---|---|---|
+| first build | 23.80s | 16.38s |
+| target directory wiped, sources untouched | **0.57s** | 0.77s |
+| every source timestamp changed | 6.73s, 51 of 309 units rebuilt | 2.11s, 4 units rebuilt |
+
+The four that rebuild on nightly are build scripts and their dependents, because
+cargo still compares timestamps for the paths a build script declares even under
+checksum freshness.
 
 A filesystem with copy-on-write clones (APFS, Btrfs, XFS) keeps snapshots free.
 Elsewhere they fall back to real copies and cost their size.
