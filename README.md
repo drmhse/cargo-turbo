@@ -30,9 +30,9 @@ comparable across rows.
 
 | | rust-analyzer | tokio | ripgrep |
 |---|---|---|---|
-| Same checkout, cold | 0.24s vs 21.12s (**88x**) | 0.11s vs 3.68s (**33x**) | 0.09s vs 3.16s (**35x**) |
-| New checkout | 9.11s vs 23.41s (**2.6x**) | 1.37s vs 6.25s (**4.6x**) | 0.63s vs 2.72s (**4.3x**) |
-| Cold machine | 16.85s vs 21.12s (**1.25x**) | 2.70s vs 3.68s (**1.36x**) | 3.06s vs 3.16s (**1.03x**) |
+| Same checkout, cold | 0.25s vs 21.74s (**87x**) | 0.10s vs 3.40s (**34x**) | 0.08s vs 3.27s (**41x**) |
+| New checkout | 10.05s vs 25.02s (**2.5x**) | 1.33s vs 5.79s (**4.4x**) | 0.65s vs 3.11s (**4.8x**) |
+| Cold machine | 15.85s vs 21.74s (**1.37x**) | 2.90s vs 3.40s (**1.17x**) | 3.00s vs 3.27s (**1.09x**) |
 | *your crates, of total units* | *38 of 307* | *7 of 50* | *11 of 70* |
 
 Ten-core Apple M4, `rustc 1.100.0-nightly`, `check --workspace`, medians of
@@ -44,21 +44,24 @@ across all three projects. Only your own crates compile; everything else is
 handed over prebuilt.
 
 **Cold machine is the weakest row, and it depends on the shape of the graph.**
-The only lever left there is parallelism. rust-analyzer and tokio have long
-chains of crates that compile one at a time, so there are idle cores to hand out.
-ripgrep has fewer, so there is less to reclaim and it lands near break-even.
-Treat this row as "no worse than cargo", not as a reason to adopt.
+The only lever left there is parallelism, and how much of it there is to reclaim
+is decided by how long the build spends narrow. rust-analyzer ends in a long
+chain of workspace crates compiling one at a time, so there are idle cores to
+hand out and it gains the most. tokio and ripgrep stay wide almost to the end,
+where every core is already busy and there is nothing to give away, so they gain
+little. Treat this row as "no worse than cargo", not as a reason to adopt.
 
 Stable gets the first two rows in full — they need nothing unstable:
 
 | tokio, stable toolchain | `cargo` | `cargo turbo` |
 |---|---|---|
-| Same checkout, cold | 3.52s | **0.09s (39x)** |
-| New checkout | 6.04s | **2.04s (3.0x)** |
-| Cold machine | 3.52s | 3.56s (0.99x) |
+| Same checkout, cold | 3.53s | **0.09s (39x)** |
+| New checkout | 7.31s | **2.07s (3.5x)** |
+| Cold machine | 3.53s | 3.72s (0.95x) |
 
-The cold-machine row is what stable gives up: without `-Zthreads` there is no
-thread allocation to make, so it matches plain cargo.
+The cold-machine row is what stable gives up. Without `-Zthreads` there is no
+thread allocation to make, so nothing is added to the build and the small loss is
+what it costs to record the result for next time.
 
 > Figures in the rest of this document come from earlier releases and have not
 > been re-measured on the toolchain above.
@@ -75,9 +78,13 @@ versions, the build flags, and the environment variables cargo folds into its ow
 fingerprints. The same key later means the directory is put back and nothing is
 compiled.
 
-Snapshots cost almost no disk. APFS and Btrfs can copy a file by sharing its
-blocks until one copy is written, so a store reporting 2.6 GB measured 2 MB of
-actual consumption.
+Snapshots cost almost no disk at first. APFS and Btrfs can copy a file by
+sharing its blocks until one copy is written, so a store reporting 2.6 GB
+measured 2 MB of actual consumption. That holds only while the target directory
+still has the same blocks, though; once it is rebuilt they belong to the
+snapshot alone. A lineage gains a snapshot for every distinct `Cargo.lock` a
+workspace is built with, so the five most recent are kept and the rest removed
+as each new one lands (`CARGO_TURBO_KEEP`).
 
 **When the key does not match exactly**, the nearest snapshot is restored rather
 than falling back to a cold build. Snapshots of one workspace, profile and
@@ -171,8 +178,10 @@ say so and exit successfully, and the build that follows is correct, only slower
 | `CARGO_TURBO_JOBS` | cores to divide between invocations, default all |
 | `CARGO_TURBO_THREADS=0` | leave rustc single-threaded |
 | `CARGO_TURBO_NEAR=0` | require an exact key, never restore a near match |
+| `CARGO_TURBO_KEEP` | snapshots kept per workspace and profile, default 5 |
 | `CARGO_TURBO_FRESHNESS=checksum` | judge freshness by content rather than timestamps |
 | `CARGO_TURBO_OFF=1` | forward to cargo unchanged |
+| `CARGO_TURBO_TIME=1` | report how long each phase of this tool took |
 
 `CARGO_TURBO_FRESHNESS=checksum` is the one worth knowing about. It suits a
 snapshot restored into a checkout whose files all have new timestamps — a cache
@@ -204,8 +213,8 @@ Elsewhere they fall back to real copies and cost their size.
 did.** There is no magic; there is only reuse.
 
 **A workspace's own crates are never shared between checkouts.** So the floor for
-a fresh clone is however long your own crates take — 9.11s of rust-analyzer's
-23.41s is exactly that.
+a fresh clone is however long your own crates take — 10.05s of rust-analyzer's
+25.02s is exactly that.
 
 **Snapshots are local to the machine.** A build script can read a system library
 or an environment variable that cargo never fingerprints, and its result is only
@@ -213,5 +222,4 @@ reliably reusable where those are the same.
 
 ## License
 
-MIT ([LICENSE-MIT](LICENSE-MIT)) or Apache-2.0 ([LICENSE-APACHE](LICENSE-APACHE)),
-at your option.
+MIT — see [LICENSE-MIT](LICENSE-MIT).
