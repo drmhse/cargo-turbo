@@ -28,6 +28,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Where the shared units live, which the snapshot walk must not descend into.
+pub(crate) const UNITS_DIR: &str = "units";
+
+/// Snapshots kept per lineage. Enough to cover switching between a handful of
+/// branches, which is what an older snapshot is still worth an exact hit for.
+const DEFAULT_KEEP: usize = 5;
+
 use crate::key::{self, Plan};
 
 /// How cargo will be asked to judge freshness for this build.
@@ -137,8 +144,19 @@ fn usable(snapshot: &Path) -> bool {
 /// Recency is the right choice among near matches: the newest build of a
 /// workspace shares the most with the next one, whatever moved in between.
 fn nearest_in_lineage(plan: &Plan) -> Option<PathBuf> {
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    let mut stack = vec![plan.store.clone()];
+    lineage_members(&plan.store, &plan.lineage)
+        .into_iter()
+        .next()
+        .map(|(_, path)| path)
+}
+
+/// Every complete snapshot of one workspace, profile and command, newest first.
+///
+/// Ordered by the marker's timestamp, which is written last and so dates the
+/// moment the snapshot became restorable.
+fn lineage_members(store: &Path, lineage: &str) -> Vec<(std::time::SystemTime, PathBuf)> {
+    let mut found = Vec::new();
+    let mut stack = vec![store.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
@@ -146,6 +164,13 @@ fn nearest_in_lineage(plan: &Plan) -> Option<PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_dir() {
+                continue;
+            }
+            // The shared units live under here in their hundreds and none of
+            // them is a snapshot, so descending into them walks the largest part
+            // of the store to no purpose. With 665 units in the store the walk
+            // took 0.081s, and it grows with every project that shares it.
+            if entry.file_name() == UNITS_DIR {
                 continue;
             }
             if !usable(&path) {
@@ -158,23 +183,53 @@ fn nearest_in_lineage(plan: &Plan) -> Option<PathBuf> {
                 .ok()
                 .as_deref()
                 .map(str::trim)
-                != Some(plan.lineage.as_str())
+                != Some(lineage)
             {
                 continue;
             }
             let when = fs::metadata(path.join("complete"))
                 .and_then(|m| m.modified())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            if best.as_ref().is_none_or(|(b, _)| when > *b) {
-                best = Some((when, path));
-            }
+            found.push((when, path));
         }
     }
-    best.map(|(_, path)| path)
+    found.sort_by_key(|(when, _)| std::cmp::Reverse(*when));
+    found
+}
+
+/// Removes all but the newest `keep` snapshots of one lineage.
+///
+/// Nothing else ever removes a snapshot. A lineage gains one for every distinct
+/// `Cargo.lock` a workspace is built with, so a branch a day is a snapshot a
+/// day, kept for the life of the machine. That is close to free while the target
+/// directory they were cloned from still holds the same blocks, and stops being
+/// free the moment it is rebuilt: the old blocks then belong to the snapshot
+/// alone and start costing what they claim to.
+///
+/// Only whole snapshots are removed, and never the newest, so a near match is
+/// always still available. A build restoring from one that is being removed sees
+/// the copy fail and compiles instead, which is the same outcome as a miss.
+fn prune_lineage(store: &Path, lineage: &str, keep: usize) -> usize {
+    let _t = Timer::new("prune");
+    lineage_members(store, lineage)
+        .into_iter()
+        .skip(keep.max(1))
+        .filter(|(_, path)| fs::remove_dir_all(path).is_ok())
+        .count()
+}
+
+/// How many snapshots of one lineage are kept, newest first.
+fn keep_limit() -> usize {
+    env::var("CARGO_TURBO_KEEP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_KEEP)
+        .max(1)
 }
 
 /// Records a target directory, if it is worth recording.
 pub fn save(plan: &Plan, freshness: Freshness) {
+    let _t = Timer::new("save");
     if env::var("CARGO_TURBO_OFF").as_deref() == Ok("1") || !plan.target_dir.is_dir() {
         return;
     }
@@ -217,6 +272,9 @@ pub fn save(plan: &Plan, freshness: Freshness) {
     if fs::rename(&staging, &snapshot).is_err() {
         let _ = fs::remove_dir_all(&staging);
     }
+    // Only after the new snapshot is in place, so the lineage is never empty and
+    // the one just written is the newest and so never a candidate.
+    prune_lineage(&plan.store, &plan.lineage, keep_limit());
 }
 
 /// Runs cargo for this plan, with the flags that make a restore usable.
@@ -395,7 +453,7 @@ pub fn status() -> i32 {
             let path = entry.path();
             // The shared units are counted separately, and there are hundreds of
             // them, so the snapshot walk stops at their door.
-            if entry.file_name() == "units" {
+            if entry.file_name() == UNITS_DIR {
                 continue;
             }
             if path.join("complete").exists() {
@@ -409,7 +467,7 @@ pub fn status() -> i32 {
     // Prebuilt dependencies, which are what a project the store has never seen
     // draws on, grouped by toolchain and profile.
     let mut units = 0usize;
-    if let Ok(scopes) = fs::read_dir(store.join("units")) {
+    if let Ok(scopes) = fs::read_dir(store.join(UNITS_DIR)) {
         for scope in scopes.flatten() {
             units += fs::read_dir(scope.path()).map_or(0, |e| e.count());
         }
@@ -433,6 +491,12 @@ pub fn status() -> i32 {
 
 pub fn clean() -> i32 {
     let store = key::store_dir();
+    // Finished builds leave their ticket directories behind, and nothing else
+    // reclaims them, so this is the only thing that ever does.
+    let tickets = crate::wrapper::clean_tickets();
+    if tickets > 0 {
+        println!("cargo-turbo: removed {tickets} leftover ticket directories");
+    }
     match fs::remove_dir_all(&store) {
         Ok(()) => {
             println!("cargo-turbo: removed {}", store.display());
@@ -442,6 +506,31 @@ pub fn clean() -> i32 {
         Err(e) => {
             eprintln!("cargo-turbo: could not remove {}: {e}", store.display());
             1
+        }
+    }
+}
+
+/// Reports how long one phase of the wrapper's own work took.
+///
+/// The phases are cheap and easy to assume are cheap, which is how a walk of the
+/// whole store ended up running on every save and went unnoticed at 0.081s. This
+/// is what caught it, so it stays.
+pub(crate) struct Timer(&'static str, std::time::Instant);
+
+impl Timer {
+    pub(crate) fn new(phase: &'static str) -> Self {
+        Timer(phase, std::time::Instant::now())
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        if env::var("CARGO_TURBO_TIME").is_ok() {
+            eprintln!(
+                "cargo-turbo: {} took {:.3}s",
+                self.0,
+                self.1.elapsed().as_secs_f64()
+            );
         }
     }
 }
@@ -514,6 +603,43 @@ mod tests {
         fs::write(dir.join("complete"), "aa11").unwrap();
         assert_eq!(nearest_in_lineage(&plan), Some(dir));
 
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_and_spares_other_lineages() {
+        let store = scratch("prune");
+        let at = |n| std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(n);
+        // Four snapshots of one lineage, and one of another that must survive
+        // whatever happens to the first.
+        let mut mine = Vec::new();
+        for (i, key) in ["aa11", "bb22", "cc33", "dd44"].iter().enumerate() {
+            let dir = record(&store, key, "mine");
+            set_modified(&dir.join("complete"), at(1_000 + i as u64 * 100));
+            mine.push(dir);
+        }
+        let theirs = record(&store, "ee55", "yours");
+        set_modified(&theirs.join("complete"), at(500));
+
+        assert_eq!(prune_lineage(&store, "mine", 2), 2);
+
+        assert!(!mine[0].exists(), "the oldest should go");
+        assert!(!mine[1].exists(), "the next oldest should go");
+        assert!(mine[2].exists(), "the second newest is kept");
+        assert!(mine[3].exists(), "the newest is always kept");
+        assert!(theirs.exists(), "another lineage must be untouched");
+
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn pruning_never_empties_a_lineage() {
+        let store = scratch("prune-floor");
+        let only = record(&store, "aa11", "mine");
+        // A keep of zero would otherwise remove the very snapshot a near match
+        // depends on, leaving the next build to start cold.
+        assert_eq!(prune_lineage(&store, "mine", 0), 0);
+        assert!(only.exists());
         let _ = fs::remove_dir_all(&store);
     }
 

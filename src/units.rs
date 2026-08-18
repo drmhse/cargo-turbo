@@ -3,8 +3,8 @@
 //! A snapshot only helps a project that has been built before. The first build of
 //! a project the store has never seen starts from nothing, even though most of it
 //! is third-party code some other project on the machine has already compiled:
-//! measured on rust-analyzer, 250 of 288 units are third-party and account for
-//! 77% of the CPU.
+//! measured on rust-analyzer, 269 of 307 units are third-party and account for
+//! most of the CPU.
 //!
 //! Those units are shareable, and cargo has already done the hard part of saying
 //! so. Every artifact it writes is named `<crate>-<hash>`, where the hash covers
@@ -56,6 +56,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::key::{hash, Plan};
+
+/// Names a unit entry that is still being assembled.
+const STAGING_PREFIX: &str = ".staging-";
 use crate::snapshot::Freshness;
 
 /// One unit's files, as they sit relative to the profile directory.
@@ -74,6 +77,7 @@ struct Fragment {
 ///
 /// Returns how many units were supplied.
 pub fn seed(plan: &Plan, freshness: Freshness) -> usize {
+    let _t = crate::snapshot::Timer::new("seed");
     // Only the packages this build actually resolves to, so an unrelated
     // project's crates are never copied in. The hash is unknown until cargo runs,
     // so every stored variant of a wanted package is offered and cargo picks the
@@ -132,6 +136,7 @@ fn seed_one(
 
 /// Adds this build's third-party units to the store.
 pub fn record(plan: &Plan, freshness: Freshness, compiled: bool) {
+    let _t = crate::snapshot::Timer::new("record");
     // Only packages this build resolved from outside the workspace. Asking
     // instead which units are *not* local admitted anything that happened to be
     // sitting in the directory, and a near-match restore leaves another
@@ -163,6 +168,7 @@ fn record_one(
     if !compiled && store.is_dir() {
         return;
     }
+    sweep_staging(&store);
 
     for fragment in fragments(&profile) {
         let Some(crate_name) = fragment.key.rsplit_once('-').map(|(c, _)| c) else {
@@ -177,7 +183,11 @@ fn record_one(
         if entry.exists() {
             continue;
         }
-        let staging = store.join(format!(".staging-{}-{}", std::process::id(), fragment.key));
+        let staging = store.join(format!(
+            "{STAGING_PREFIX}{}-{}",
+            std::process::id(),
+            fragment.key
+        ));
         let _ = fs::remove_dir_all(&staging);
         if fs::create_dir_all(&staging).is_err() {
             continue;
@@ -198,6 +208,43 @@ fn record_one(
             let _ = fs::remove_dir_all(&staging);
         }
     }
+}
+
+/// Removes staging directories a killed build left behind.
+///
+/// An entry is assembled under `.staging-<pid>-<key>` and renamed into place, so
+/// a build that dies between the two leaves one behind. Both the success and the
+/// failure path clean up after themselves; nothing cleans up after a kill, and
+/// `clean` reclaiming them only by removing the entire store is not much of an
+/// answer.
+///
+/// Age decides, rather than whether the owning process is still alive, because
+/// asking that needs a libc this deliberately does not depend on. Staging one
+/// unit is a copy of a few files, so anything untouched for an hour belongs to a
+/// build that is gone -- and a directory still being written is far too young to
+/// qualify, which is what keeps this from stealing work from a live build.
+fn sweep_staging(store: &Path) -> usize {
+    const STALE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+    let Ok(entries) = fs::read_dir(store) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(STAGING_PREFIX))
+        })
+        .filter(|e| {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_some_and(|age| age > STALE)
+        })
+        .filter(|e| fs::remove_dir_all(e.path()).is_ok())
+        .count()
 }
 
 /// Whether cargo has already built in a profile directory.
@@ -318,7 +365,9 @@ fn merge_into(entry: &Path, profile: &Path) -> Result<(), String> {
 /// rebuilt regardless.
 fn unit_store(plan: &Plan, freshness: Freshness, profile_dir: &str) -> PathBuf {
     let scope = hash(format!("{}|{profile_dir}|{}", plan.toolchain, freshness.label()).as_bytes());
-    plan.store.join("units").join(format!("{scope:016x}"))
+    plan.store
+        .join(crate::snapshot::UNITS_DIR)
+        .join(format!("{scope:016x}"))
 }
 
 /// Package names in `Cargo.lock`, split by whether they come from outside.
@@ -364,6 +413,42 @@ fn foreign_packages(plan: &Plan) -> HashSet<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_killed_builds_staging_is_reclaimed_but_a_live_one_is_not() {
+        let store = std::env::temp_dir().join(format!("cargo-turbo-sweep-u{}", std::process::id()));
+        let _ = fs::remove_dir_all(&store);
+        let stale = store.join(format!("{STAGING_PREFIX}111-serde-abc"));
+        let fresh = store.join(format!("{STAGING_PREFIX}222-serde-def"));
+        let entry = store.join("serde-ghi");
+        for d in [&stale, &fresh, &entry] {
+            fs::create_dir_all(d).unwrap();
+        }
+        // Two hours old: the build that owned it is long gone.
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        set_modified(&stale, long_ago);
+
+        assert_eq!(sweep_staging(&store), 1);
+
+        assert!(!stale.exists(), "a dead build's staging should be reclaimed");
+        assert!(fresh.exists(), "a build still staging must not be robbed");
+        assert!(entry.exists(), "finished entries must be left alone");
+
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    /// `filetime` is not a dependency, so the timestamp is moved by rewriting the
+    /// directory's own metadata through a file inside it.
+    fn set_modified(path: &Path, when: std::time::SystemTime) {
+        let marker = path.join("marker");
+        fs::write(&marker, b"").unwrap();
+        let f = fs::File::options().write(true).open(&marker).unwrap();
+        f.set_modified(when).unwrap();
+        // The directory's own mtime follows its most recent change, so it is set
+        // directly too.
+        let d = fs::File::open(path).unwrap();
+        let _ = d.set_modified(when);
+    }
+
     use super::*;
 
     const LOCK: &str = r#"

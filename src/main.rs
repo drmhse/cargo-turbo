@@ -4,11 +4,11 @@
 //! Two measurements motivate everything here, taken on a ten-core Apple M4
 //! checking rust-analyzer from an empty target directory:
 //!
-//! * The build uses 2.34 of ten cores. Dependencies fan out and saturate the
+//! * The build uses 3.9 of ten cores. Dependencies fan out and saturate the
 //!   machine for the first third, then concurrency collapses to one while the
 //!   workspace crates compile in a chain, each waiting on the metadata of the
 //!   one below it.
-//! * Of 288 units, 250 are third-party and account for 77% of the CPU. Those are
+//! * Of 307 units, 269 are third-party and account for most of the CPU. Those are
 //!   immutable: a given version of a crate, built with the same features,
 //!   profile and compiler, produces the same bytes every time.
 //!
@@ -188,9 +188,11 @@ ENVIRONMENT:
     CARGO_TURBO_JOBS      cores to divide between invocations (default: all)
     CARGO_TURBO_THREADS   set to 0 to leave rustc single-threaded
     CARGO_TURBO_NEAR      set to 0 to require an exact key, never a near match
+    CARGO_TURBO_KEEP      snapshots kept per workspace and profile (default: 5)
     CARGO_TURBO_FRESHNESS set to checksum to judge freshness by content instead
                           of timestamps: better for a cache unpacked over a
                           fresh clone, worse for sharing between projects
-    CARGO_TURBO_OFF       set to 1 to forward to cargo unchanged"
+    CARGO_TURBO_OFF       set to 1 to forward to cargo unchanged
+    CARGO_TURBO_TIME      set to report how long each phase of this tool took"
     );
 }
