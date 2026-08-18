@@ -13,27 +13,53 @@
 //!
 //! The obvious approach derives it from the dependency graph: find each unit's
 //! depth, count how many units share that depth, and divide. That was measured
-//! at 1.30x. Counting how many invocations are *actually* running reaches 1.42x,
-//! because the graph says how wide a build could be and the count says how wide
-//! it is. A unit whose siblings finished early gets the machine either way.
+//! at 1.30x, against 1.42x for counting how many invocations are running: the
+//! graph says how wide a build could be and the count says how wide it is, and a
+//! unit whose siblings finished early gets the machine either way.
+//!
+//! Take the 1.42x with salt. It was measured while the count was stuck at one
+//! (see below), so what it actually compared was the graph against blanket
+//! allocation, not against counting. The argument for counting stands on its own
+//! terms; the number does not, and the two designs have never been measured
+//! against each other with the count working.
 //!
 //! Handing every invocation eight threads is worse than doing nothing: the
 //! fan-out phase is already full, and blanket `-Zthreads=8` took the same build
 //! from 27.51s to 39.08s.
 //!
+//! That blanket allocation is also what this did for a long time without meaning
+//! to. The ticket was released as the share was decided rather than held for the
+//! compile, so an invocation was only ever visible to another one inside the same
+//! few microseconds of bookkeeping: over a cold rust-analyzer check, 282 of 286
+//! invocations saw no sibling at all and took the cap. Holding the ticket across
+//! the compile is what makes the count mean what the rest of this describes, and
+//! the same check then spreads across the whole range, most invocations seeing
+//! the nine or ten that are really there.
+//!
+//! Correcting it was worth 16.89s to 16.28s of wall clock and, more to the point,
+//! 112.66s to 93.06s of CPU: the threads it stops handing out during fan-out were
+//! being paid for and returning nothing. The 39.08s above did not reproduce at
+//! that scale on a current toolchain -- blanket allocation now costs a little
+//! rather than a lot -- but it costs, and it costs most on a machine doing
+//! anything else at the same time.
+//!
 //! # Why there is no threshold
 //!
-//! A build with no tail has nothing to gain here and pays the wrapper's cost
-//! anyway: ripgrep takes 2.85s under plain cargo, 3.09s with this, and 2.82s with
-//! `CARGO_TURBO_THREADS=0`. Withholding threads until the build narrows was tried
-//! as a fix and helped neither case -- ripgrep measured 3.08s, 3.17s and 3.47s at
-//! thresholds of one, two and three siblings, and tokio was best with no threshold
-//! at all, at 2.57s against 3.24s at one. The graph shape that decides this is not
-//! visible from inside a single invocation, and the projects that lose and the
-//! projects that gain are not told apart by anything cheap: ripgrep loses and
-//! tokio gains with much the same package count and workspace depth. So the
-//! allocation stays unconditional, and a project that measures worse can turn it
-//! off.
+//! A build with no tail has little to gain here and pays the wrapper's cost
+//! anyway. On rustc 1.100.0-nightly ripgrep measures 3.16s under plain cargo
+//! against 3.06s with this, so it is close to break-even; on an earlier toolchain
+//! it was a small loss, at 2.85s against 3.09s.
+//!
+//! Withholding threads until the build narrows was tried as a fix and helped
+//! neither case -- ripgrep measured 3.08s, 3.17s and 3.47s at thresholds of one,
+//! two and three siblings, and tokio was best with no threshold at all, at 2.57s
+//! against 3.24s at one. Those threshold figures have not been re-measured since.
+//!
+//! The graph shape that decides this is not visible from inside a single
+//! invocation, and the projects that gain little and the projects that gain a lot
+//! are not told apart by anything cheap: ripgrep and tokio have much the same
+//! package count and workspace depth. So the allocation stays unconditional, and
+//! a project that measures worse can turn it off.
 
 use std::env;
 use std::ffi::OsString;
@@ -43,6 +69,9 @@ use std::process::Command;
 
 /// Past eight the returns flatten, so more only buys contention.
 const MAX_THREADS: usize = 8;
+
+/// Names the temporary directory a build's tickets live in.
+const TICKET_PREFIX: &str = "cargo-turbo-";
 
 pub fn run() -> i32 {
     let mut args = env::args_os().skip(1);
@@ -55,11 +84,21 @@ pub fn run() -> i32 {
     let mut command = Command::new(&rustc);
     command.args(&args);
 
-    if let Some(share) = thread_share() {
+    // Held across the whole compile, so the invocations that start later count
+    // this one as running. Releasing it before rustc ran left the count blind to
+    // every process actually compiling: measured over a cold rust-analyzer
+    // check, 282 of 286 invocations saw no sibling at all and took the cap.
+    let ticket = Ticket::claim();
+    if let Some(share) = thread_share(ticket.as_ref()) {
         command.arg(format!("-Zthreads={share}"));
     }
 
-    match command.status() {
+    let status = command.status();
+    // Dropped only now, so the machine is handed back when the work is over
+    // rather than when the decision was made.
+    drop(ticket);
+
+    match status {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
             eprintln!(
@@ -73,9 +112,9 @@ pub fn run() -> i32 {
 
 /// How many threads this invocation should get, or `None` to leave it alone.
 ///
-/// The ticket is released when it drops, which happens as this returns, so the
-/// count seen by a later invocation reflects only the work still running.
-fn thread_share() -> Option<usize> {
+/// The ticket is the caller's, because it has to outlive this decision: it is
+/// what makes this invocation visible to the ones that start while it compiles.
+fn thread_share(ticket: Option<&Ticket>) -> Option<usize> {
     if env::var("CARGO_TURBO_THREADS").as_deref() == Ok("0") {
         return None;
     }
@@ -86,9 +125,34 @@ fn thread_share() -> Option<usize> {
 
     // Without a ticket the concurrency is unknown, and assuming the build is
     // wide leaves rustc single-threaded, which is what cargo does unaided.
-    let ticket = Ticket::claim()?;
-    let share = (jobs / ticket.siblings().max(1)).clamp(1, MAX_THREADS);
-    drop(ticket);
+    share_for(jobs, ticket?.siblings())
+}
+
+/// The policy itself, kept free of the environment so it can be tested.
+///
+/// `None` means the flag is not passed at all, which is the right answer for a
+/// share of one: `-Zthreads=1` is what rustc does unaided, so sending it only
+/// adds an argument and a reason for the fingerprint to differ.
+///
+/// # Why the machine is divided exactly
+///
+/// Handing each core out two or three times over was tried and rejected. It
+/// buys a little wall clock and pays for it in CPU, which is the wrong trade for
+/// something that runs on a machine doing other work:
+///
+/// | cold, factor 1 to 3 | wall | CPU |
+/// |---|---|---|
+/// | rust-analyzer | 16.3s to 15.8s | 93s to 108s |
+/// | tokio | 2.74s to 2.53s | 10.8s to 13.1s |
+/// | ripgrep | 3.06s to 3.12s | 15.6s to 18.2s |
+///
+/// Three to seven per cent of wall for sixteen to nineteen per cent of CPU, and
+/// ripgrep does not even get the wall back. Worth re-testing only against a
+/// working sibling count: the first attempt at this was measured while the count
+/// was stuck at one, where a factor changes almost nothing and the result meant
+/// nothing.
+fn share_for(jobs: usize, siblings: usize) -> Option<usize> {
+    let share = (jobs / siblings.max(1)).clamp(1, MAX_THREADS);
     (share > 1).then_some(share)
 }
 
@@ -106,7 +170,7 @@ impl Ticket {
     fn claim() -> Option<Self> {
         // Scoped to the build, so two builds running side by side each see their
         // own width rather than each other's.
-        let dir = env::temp_dir().join(format!("cargo-turbo-{}", build_scope()));
+        let dir = env::temp_dir().join(format!("{TICKET_PREFIX}{}", build_scope()));
         fs::create_dir_all(&dir).ok()?;
         let path = dir.join(std::process::id().to_string());
         fs::write(&path, b"").ok()?;
@@ -116,6 +180,40 @@ impl Ticket {
     fn siblings(&self) -> usize {
         fs::read_dir(&self.dir).map_or(1, |entries| entries.count().max(1))
     }
+}
+
+/// Removes the ticket directories that finished builds left behind.
+///
+/// A directory is deliberately not removed when its last ticket drops, because
+/// that would race a sibling claiming a ticket inside it. Nothing else reclaims
+/// them, so they accumulate for the life of the machine: one per workspace,
+/// profile and target directory. Fifty-four had gathered on the machine this
+/// was written on.
+///
+/// Only empty directories are removed, and `remove_dir` refusing a non-empty
+/// one *is* the test for "no invocation is using this". A build that loses the
+/// race recreates the directory on its next claim, and a claim that fails
+/// merely leaves that one rustc single-threaded, so the worst case is a lost
+/// thread share rather than a broken build.
+pub fn clean_tickets() -> usize {
+    clean_tickets_in(&env::temp_dir())
+}
+
+/// The directory is a parameter so a test can be confined to one it created;
+/// sweeping the real temporary directory would disturb builds running beside it.
+fn clean_tickets_in(dir: &std::path::Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(TICKET_PREFIX))
+        })
+        .filter(|e| fs::remove_dir(e.path()).is_ok())
+        .count()
 }
 
 impl Drop for Ticket {
@@ -178,20 +276,40 @@ mod tests {
 
     #[test]
     fn a_lone_invocation_gets_the_machine_up_to_the_cap() {
-        assert_eq!((10_usize / 1).clamp(1, MAX_THREADS), MAX_THREADS);
+        assert_eq!(share_for(10, 1), Some(MAX_THREADS));
+        // Even on a machine wider than the cap, which is what the cap is for.
+        assert_eq!(share_for(128, 1), Some(MAX_THREADS));
     }
 
     #[test]
     fn a_wide_build_leaves_every_invocation_single_threaded() {
-        assert_eq!((10_usize / 30).clamp(1, MAX_THREADS), 1);
-        // And a share of one is not passed to rustc at all.
-        assert!(!(1 > 1));
+        // A share of one is not passed to rustc at all, so this is `None`
+        // rather than `Some(1)`.
+        assert_eq!(share_for(10, 30), None);
+        assert_eq!(share_for(10, 10), None);
     }
 
     #[test]
     fn the_share_divides_the_machine() {
-        assert_eq!((10_usize / 4).clamp(1, MAX_THREADS), 2);
-        assert_eq!((10_usize / 2).clamp(1, MAX_THREADS), 5);
+        assert_eq!(share_for(10, 4), Some(2));
+        assert_eq!(share_for(10, 2), Some(5));
+    }
+
+    #[test]
+    fn a_saturated_build_gets_no_flag_at_all() {
+        // A core each or less: the machine is already full, and this is the
+        // case that made blanket `-Zthreads=8` a loss.
+        assert_eq!(share_for(10, 10), None);
+        assert_eq!(share_for(10, 11), None);
+    }
+
+    #[test]
+    fn a_miscounted_ticket_never_divides_by_zero() {
+        // `siblings` counts directory entries and this invocation's own ticket
+        // is one of them, so zero should be impossible -- but a racing cleanup
+        // could still read an empty directory, and dividing by it would panic
+        // inside a build rather than merely misjudge the share.
+        assert_eq!(share_for(10, 0), Some(MAX_THREADS));
     }
 
     #[test]
@@ -242,6 +360,28 @@ mod tests {
             }
         }
         "shared".into()
+    }
+
+    #[test]
+    fn cleaning_reclaims_finished_builds_but_spares_running_ones() {
+        let tmp = env::temp_dir().join(format!("cargo-turbo-sweep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let idle = tmp.join(format!("{TICKET_PREFIX}idle"));
+        let busy = tmp.join(format!("{TICKET_PREFIX}busy"));
+        let other = tmp.join("unrelated");
+        for d in [&idle, &busy, &other] {
+            fs::create_dir_all(d).unwrap();
+        }
+        // A build still running holds a ticket inside its directory.
+        fs::write(busy.join("1234"), b"").unwrap();
+
+        clean_tickets_in(&tmp);
+
+        assert!(!idle.exists(), "a finished build's directory should be gone");
+        assert!(busy.exists(), "a running build must not be disturbed");
+        assert!(other.exists(), "unrelated temp directories must be left alone");
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
